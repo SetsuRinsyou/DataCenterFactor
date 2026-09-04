@@ -1,0 +1,26 @@
+"""论文中期动量定义的21交易日月度映射。"""
+
+import pandas as pd
+
+from factor_base import FactorBase
+
+
+class IntermediateMomentum(FactorBase):
+    """过去第7至第12个21交易日区段收益率之和。"""
+
+    def __init__(self):
+        super().__init__(window="252D", data_fields=["close"])
+
+    def calculate_daily_factor(
+        self,
+        trade_date: str,
+        symbols: list[str],
+        market_data: dict[str, pd.DataFrame],
+        history_start: str,
+    ) -> pd.Series:
+        close_window = market_data["close"].loc[
+            history_start:trade_date,
+            symbols,
+        ].dropna(how="all")
+        block_returns = close_window.iloc[::21].pct_change(fill_method=None)
+        return block_returns.iloc[1:7].sum(axis=0, min_count=6).reindex(symbols)

@@ -1,0 +1,25 @@
+# Local environments and secrets
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Python caches and tooling output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local data and generated artifacts
+data/
+tmp/
+*.duckdb
+*.duckdb.wal
+*.zip
+*.log
+
+# OS metadata
+.DS_Store
+.vscode/**
