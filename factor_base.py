@@ -173,6 +173,104 @@ class FactorBase(ABC):
         group_returns_frame.index.name = "trade_date"
         return signal_frame, rank_ic_series, group_returns_frame
 
+    def calculate_group_net_values(
+        self,
+        signal_frame: pd.DataFrame,
+        data_manager: DataManager,
+        rebalance_days: int,
+    ) -> pd.DataFrame:
+        """次日收盘调仓、持有期固定复权份额，逐交易日计算五组净值。
+
+        无费用；停牌仓位保留，不能买入的目标份额留作现金。
+        非停牌报价缺失时拒绝继续估值，避免静默丢失持仓。
+        """
+        if (
+            isinstance(rebalance_days, bool)
+            or not isinstance(rebalance_days, (int, np.integer))
+            or rebalance_days <= 0
+        ):
+            raise ValueError("rebalance_days must be a positive integer")
+        dates = data_manager.calender.loc[
+            data_manager.calender["is_open"] == 1, "cal_date"
+        ].tolist()
+        labels = [f"group_{group}" for group in range(1, 6)]
+        result = pd.DataFrame(
+            index=pd.Index(dates[1:], name="trade_date"), columns=labels, dtype=float
+        )
+        if result.empty:
+            return result
+        suspended = {}
+        for date, symbol in data_manager.connection.execute(
+            """SELECT trade_date, ts_code FROM anomaly
+               WHERE trade_date BETWEEN ? AND ? AND value LIKE '%SUSPENDED%'""",
+            [dates[1], dates[-1]],
+        ).fetchall():
+            suspended.setdefault(date, set()).add(symbol)
+        holdings = {label: pd.Series(dtype=float) for label in labels}
+        cash = dict.fromkeys(labels, 1.0)
+        last_prices = pd.Series(dtype=float)
+
+        for signal_position in range(0, len(dates) - 1, int(rebalance_days)):
+            signal_date = dates[signal_position]
+            period_dates = dates[
+                signal_position + 1:signal_position + 1 + int(rebalance_days)
+            ]
+            signal = (
+                signal_frame.loc[signal_date].replace([np.inf, -np.inf], np.nan).dropna()
+                if signal_date in signal_frame.index
+                else pd.Series(dtype=float)
+            )
+            groups = (
+                pd.qcut(signal.rank(method="first"), q=5, labels=labels)
+                if len(signal) >= 5 else None
+            )
+            symbols = sorted(set(signal.index).union(
+                *(set(position.index) for position in holdings.values())
+            ))
+            prices = (
+                data_manager.get_market_data(period_dates, "1D", ["close"], symbols)
+                ["close"].unstack("ts_code").reindex(index=period_dates, columns=symbols)
+                if symbols else pd.DataFrame(index=period_dates)
+            )
+            prices = prices.where(np.isfinite(prices) & (prices > 0))
+            for date in period_dates:
+                unavailable = suspended.get(date, set())
+                marks = prices.loc[date].copy()
+                for symbol in unavailable.intersection(marks.index):
+                    if pd.isna(marks[symbol]) and symbol in last_prices.index:
+                        marks[symbol] = last_prices[symbol]
+                for label in labels:
+                    position = holdings[label]
+                    held_prices = marks.reindex(position.index)
+                    if held_prices.isna().any():
+                        missing = held_prices.index[held_prices.isna()].tolist()
+                        raise ValueError(f"Missing held-stock price on {date}: {missing}")
+                    wealth = cash[label] + float((position * held_prices).sum())
+                    result.loc[date, label] = wealth
+                    if date != period_dates[0] or groups is None:
+                        continue
+                    # 停牌旧仓无法卖出，其余资金在目标股票之间等额分配。
+                    locked = position[position.index.isin(unavailable)]
+                    budget = wealth - float((locked * marks.reindex(locked.index)).sum())
+                    targets = groups.index[
+                        (groups == label) & ~groups.index.isin(locked.index)
+                    ]
+                    new_position = locked.copy()
+                    cash[label] = budget
+                    if len(targets):
+                        allocation = budget / len(targets)
+                        for symbol in targets:
+                            if symbol in unavailable:
+                                continue
+                            if pd.isna(marks[symbol]):
+                                raise ValueError(f"Missing entry price on {date}: {symbol}")
+                            if allocation > 0:
+                                new_position.loc[symbol] = allocation / marks[symbol]
+                                cash[label] -= allocation
+                    holdings[label] = new_position
+                last_prices = marks.combine_first(last_prices)
+        return result
+
     @staticmethod
     def calculate_group_returns(
         signal: pd.Series,

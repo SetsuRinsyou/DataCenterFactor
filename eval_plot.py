@@ -114,48 +114,39 @@ def plot_ic(
 
 
 def plot_group_cumulative_returns(
-    group_returns: pd.DataFrame,
-    forward_days: int,
+    group_net_values: pd.DataFrame,
     output_path: str | Path = DEFAULT_PLOT_DIR / "group_cumulative_returns.png",
 ) -> Path:
-    """按 1/N 采样非重叠 N 日收益，绘制各组累计收益及绩效指标。"""
-    if not isinstance(group_returns, pd.DataFrame):
-        raise TypeError("group_returns must be a pandas DataFrame")
-    validate_forward_days(forward_days)
-    if group_returns.empty or group_returns.shape[1] == 0:
-        raise ValueError("group_returns must contain at least one group")
-
-    numeric_returns = group_returns.apply(pd.to_numeric, errors="coerce").replace(
-        [np.inf, -np.inf], np.nan
-    )
-    sampled_returns = numeric_returns.iloc[::forward_days]
-    periods_per_year = 252 / forward_days
+    """绘制每日持仓净值对应的累计收益，并计算每日绩效指标。"""
+    if not isinstance(group_net_values, pd.DataFrame):
+        raise TypeError("group_net_values must be a pandas DataFrame")
+    if group_net_values.empty or group_net_values.shape[1] == 0:
+        raise ValueError("group_net_values must contain at least one group")
+    wealth_frame = group_net_values.apply(pd.to_numeric, errors="coerce")
+    if (not np.isfinite(wealth_frame.to_numpy()).all()
+            or (wealth_frame <= 0).any().any()):
+        raise ValueError("group_net_values must contain finite positive daily values")
+    if not wealth_frame.index.is_unique or not wealth_frame.index.is_monotonic_increasing:
+        raise ValueError("group_net_values dates must be unique and increasing")
+    if not np.allclose(wealth_frame.iloc[0], 1.0):
+        raise ValueError("group_net_values must start at 1")
 
     figure = Figure(figsize=(12, 6))
     FigureCanvasAgg(figure)
     axis = figure.subplots()
-    plotted_groups = 0
 
-    for group_name in sampled_returns.columns:
-        returns = sampled_returns[group_name].dropna()
-        if returns.empty:
-            continue
-        if (returns < -1).any():
-            raise ValueError(f"{group_name} contains a return below -100%")
-
-        wealth = (1 + returns).cumprod()
+    for group_name in wealth_frame.columns:
+        wealth = wealth_frame[group_name]
+        returns = wealth.pct_change(fill_method=None).iloc[1:]
         cumulative_returns = wealth - 1
         total_growth = float(wealth.iloc[-1])
         annualized_return = (
-            total_growth ** (periods_per_year / len(returns)) - 1
-            if total_growth >= 0
-            else np.nan
+            total_growth ** (252 / len(returns)) - 1 if len(returns) else np.nan
         )
-        running_peak = wealth.cummax().clip(lower=1.0)
-        max_drawdown = float((wealth / running_peak - 1).min())
+        max_drawdown = float((wealth / wealth.cummax() - 1).min())
         return_std = float(returns.std(ddof=1)) if len(returns) >= 2 else np.nan
         sharpe = (
-            float(returns.mean()) / return_std * np.sqrt(periods_per_year)
+            float(returns.mean()) / return_std * np.sqrt(252)
             if np.isfinite(return_std) and return_std > 0
             else np.nan
         )
@@ -169,15 +160,9 @@ def plot_group_cumulative_returns(
                 f"max drawdown={max_drawdown:.2%}, Sharpe={sharpe:.2f})"
             ),
         )
-        plotted_groups += 1
-
-    if plotted_groups == 0:
-        raise ValueError("group_returns has no finite values after 1/N sampling")
 
     axis.axhline(0, color="black", linewidth=0.8, alpha=0.6)
-    axis.set_title(
-        f"Group cumulative returns (sampled every {forward_days} observations)"
-    )
+    axis.set_title("Group cumulative returns (daily valuation)")
     axis.set_xlabel("Trade date")
     axis.set_ylabel("Cumulative return")
     axis.yaxis.set_major_formatter(PercentFormatter(1.0))

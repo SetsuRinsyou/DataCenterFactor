@@ -13,6 +13,7 @@ from statsmodels.regression.linear_model import OLS
 
 from data_manager import DataManager
 from factor_base import FactorBase
+from eval_plot import plot_group_cumulative_returns
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -234,6 +235,9 @@ def main() -> None:
             data_manager,
             args.forward_days,
         )
+        group_net_values = factor.calculate_group_net_values(
+            signal_frame, data_manager, args.forward_days
+        )
     finally:
         data_manager.connection.close()
     calculation_seconds = perf_counter() - calculation_started
@@ -246,6 +250,10 @@ def main() -> None:
         factor_name,
     )
     save_seconds = perf_counter() - save_started
+    plot_path = plot_group_cumulative_returns(
+        group_net_values,
+        SCRIPT_ROOT / "tmp" / "plots" / f"{factor_name}_group_cumulative_returns.png",
+    )
 
     print("\n计算结果")
     print(f"因子形状: {signal_frame.shape}")
@@ -263,6 +271,8 @@ def main() -> None:
     print("五分层平均收益:")
     for group_name, group_return in group_returns.mean().items():
         print(f"  {group_name}: {group_return:.8%}")
+    print(f"每日净值形状: {group_net_values.shape}")
+    print(f"收益曲线: {plot_path}")
     print(f"写入数据库: {output_db}")
     print(f"写入非空因子值: {saved_rows}")
     print(f"计算耗时: {calculation_seconds:.3f} 秒")
