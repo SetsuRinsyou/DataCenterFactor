@@ -31,6 +31,11 @@ def parse_args() -> argparse.Namespace:
         default=str(SCRIPT_ROOT / "data" / "factor_results.duckdb"),
         help="保存因子值的新 DuckDB 文件路径",
     )
+    parser.add_argument(
+        "--minute-db-path",
+        default=str(SCRIPT_ROOT / "data" / "market_1min.duckdb"),
+        help="分钟行情数据库路径，仅分钟因子使用",
+    )
     parser.add_argument("--pool-name", default="zz500", help="股票池名称")
     parser.add_argument("--start-date", required=True, help="开始日期，格式 YYYYMMDD")
     parser.add_argument("--end-date", required=True, help="结束日期，格式 YYYYMMDD")
@@ -219,6 +224,9 @@ def main() -> None:
         args.factor_params,
     )
     factor_name = f"{factor.__class__.__name__}_{factor.window}"
+    minute_db = Path(args.minute_db_path).expanduser().resolve() if factor.minute_fields else None
+    if minute_db is not None and output_db == minute_db:
+        raise ValueError("output-db must be different from the minute database")
     print(f"因子: {factor_name}")
     print(f"区间: {args.start_date} - {args.end_date}")
     print(f"预测周期: {args.forward_days} 个交易日")
@@ -229,6 +237,7 @@ def main() -> None:
         args.pool_name,
         args.start_date,
         args.end_date,
+        minute_db_path=str(minute_db) if minute_db is not None else None,
     )
     try:
         signal_frame, rank_ic, group_returns = factor.compute_eval(
@@ -239,7 +248,7 @@ def main() -> None:
             signal_frame, data_manager, args.forward_days
         )
     finally:
-        data_manager.connection.close()
+        data_manager.close()
     calculation_seconds = perf_counter() - calculation_started
 
     ic_statistics = calculate_ic_statistics(rank_ic, args.forward_days)

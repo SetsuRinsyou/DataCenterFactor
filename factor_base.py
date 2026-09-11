@@ -18,6 +18,8 @@ class FactorBase(ABC):
         data_fields: list[str],
         index_code: str | None = None,
         requires_ff3: bool = False,
+        minute_fields: list[str] | None = None,
+        minute_window_days: int = 1,
     ):
         window_match = re.fullmatch(r"([1-9]\d*)([DMY])", window)
         if window_match is None:
@@ -29,6 +31,12 @@ class FactorBase(ABC):
         self.data_fields = data_fields
         self.index_code = index_code
         self.requires_ff3 = requires_ff3
+        self.minute_fields = list(minute_fields or [])
+        if (isinstance(minute_window_days, bool)
+                or not isinstance(minute_window_days, (int, np.integer))
+                or minute_window_days < 1):
+            raise ValueError("minute_window_days must be a positive integer")
+        self.minute_window_days = int(minute_window_days)
 
     def compute_eval(
         self, data_manager: DataManager, forward_days: int
@@ -59,6 +67,15 @@ class FactorBase(ABC):
             if field not in data_manager.market_columns
             and field in data_manager.financial_columns
         ]
+        minute_field_names = self.minute_fields
+        unknown_minute_fields = (
+            set(minute_field_names) - (data_manager.minute_columns - {"trade_time", "ts_code"})
+            if minute_field_names else set()
+        )
+        if unknown_minute_fields:
+            raise ValueError(f"Unknown minute fields: {sorted(unknown_minute_fields)}")
+        if len(set(minute_field_names)) != len(minute_field_names):
+            raise ValueError("Duplicate minute fields")
 
         all_signal_dates = data_manager.calender.loc[
             data_manager.calender["is_open"] == 1, "cal_date"
@@ -82,6 +99,8 @@ class FactorBase(ABC):
         # 同一成分股快照区间内，行情和财务数据各自最多读取一次。
         for signal_dates, constituent_symbols in data_manager.get_constituent_periods():
             data_parts = []
+            minute_cache = {}
+
             if market_field_names:
                 data_parts.append(
                     data_manager.get_market_data(
@@ -100,17 +119,13 @@ class FactorBase(ABC):
                         constituent_symbols,
                     )
                 )
+
             if data_parts:
                 input_data = pd.concat(data_parts, axis=1).reindex(
                     columns=self.data_fields
                 )
             else:
-                input_data = data_manager.get_market_data(
-                    signal_dates,
-                    self.window,
-                    [],
-                    constituent_symbols,
-                )
+                input_data = pd.DataFrame()
             return_ratios = data_manager.get_eval_data(
                 signal_dates,
                 forward_days,
@@ -133,12 +148,48 @@ class FactorBase(ABC):
                     date,
                     self.window,
                 )
-                signal = self.calculate_daily_factor(
-                    date,
-                    symbols,
-                    market_fields,
-                    history_start
-                ).reindex(symbols)
+                daily_fields = {
+                    field: values.loc[:date] for field, values in market_fields.items()
+                }
+                if minute_field_names:
+                    position = data_manager.open_date_positions[date]
+                    read_days = self.minute_window_days
+                    if minute_cache:
+                        last_position = data_manager.open_date_positions[max(minute_cache)]
+                        read_days = min(read_days, position - last_position)
+                    # 首次完整窗口由数据管理器校验；后续只读取缓存之后的新交易日。
+                    minute_data = data_manager.get_minute_data(
+                        date, minute_field_names, constituent_symbols, window_days=read_days
+                    )
+                    minute_dates = data_manager.open_dates[
+                        position - self.minute_window_days + 1:position + 1
+                    ]
+                    minute_cache.update({
+                        day: frame for day, frame in minute_data.groupby(
+                            minute_data.index.get_level_values("trade_time").strftime("%Y%m%d")
+                        )
+                    })
+                    # 只保留窗口内日期；没有记录的交易日用空表占位。
+                    minute_cache = {
+                        day: minute_cache.get(day, minute_data.iloc[:0].copy())
+                        for day in minute_dates
+                    }
+                    minute_data = pd.concat(minute_cache.values()).sort_index()
+                    # 空交易日也保留在元数据中，因子按该日历对齐后再做跨日统计。
+                    minute_data.attrs["trade_dates"] = tuple(minute_dates)
+                    present = minute_cache[date].index.get_level_values("ts_code").intersection(symbols).nunique()
+                    signal = self.calculate_daily_factor(
+                        date, symbols, daily_fields,
+                        history_start, minute_data=minute_data,
+                    ).reindex(symbols)
+                    print(f"MINUTE {date}: window={minute_dates[0]}..{date} "
+                          f"target={len(symbols)} present={present} valid={int(np.isfinite(signal).sum())}",
+                          flush=True)
+                    del minute_data
+                else:
+                    signal = self.calculate_daily_factor(
+                        date, symbols, daily_fields, history_start
+                    ).reindex(symbols)
                 signal.name = date
                 signals.append(signal)
 
@@ -300,7 +351,14 @@ class FactorBase(ABC):
         trade_date: str,
         symbols: list[str],
         market_data: dict[str, pd.DataFrame],
-        history_start: str
+        history_start: str,
+        *,
+        minute_data: pd.DataFrame | None = None,
     ) -> pd.Series:
-        """返回单个交易日的因子截面，索引必须为股票代码。"""
+        """返回日频股票截面。
+
+        日频子类沿用原签名；声明 minute_fields 的子类接收 minute_data 关键字。
+        分钟长表索引为 (trade_time, ts_code)，窗口含当天共 minute_window_days
+        个交易日；attrs['trade_dates'] 包含缺数据的交易日。价格及单位保持原样。
+        """
         raise NotImplementedError
