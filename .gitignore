@@ -23,3 +23,4 @@ tmp/
 # OS metadata
 .DS_Store
 .vscode/**
+tests/**
