@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download SW2021 level-1 industries for all A-shares in market."""
+"""Expand SW2021 membership intervals onto market's stock/trading-day keys."""
 
 import time
 
@@ -91,42 +91,87 @@ def fetch_members(pro, l1_code: str, is_new: str) -> pd.DataFrame:
     raise AssertionError("unreachable")
 
 
-def latest_industries(members: pd.DataFrame, universe: set[str]) -> pd.DataFrame:
+def industry_intervals(members: pd.DataFrame, universe: set[str]) -> pd.DataFrame:
+    """Use inclusive membership dates; unknown history is never backfilled.
+
+    The API returns adjacent records ending 20260630 and starting 20260701,
+    for example for 000876.SZ. Excluding out_date would invent a one-day gap.
+    """
     members = members[members["ts_code"].isin(universe)].copy()
     members = members.drop_duplicates(MEMBER_COLUMNS)
-    members["in_date"] = members["in_date"].fillna("").astype(str)
-    members["out_date"] = members["out_date"].fillna("").astype(str)
-    members["current_priority"] = (members["is_new"] == "Y").astype("int8")
-    members["last_date"] = members["out_date"].where(
-        members["out_date"] != "", members["in_date"]
-    )
-    members = members.sort_values(
-        ["ts_code", "current_priority", "last_date", "in_date"],
-        ascending=[True, False, False, False],
-    )
+    if members.empty:
+        raise RuntimeError("No industry intervals match the market universe")
+    for field in ["l1_code", "l1_name", "in_date"]:
+        if members[field].isna().any() or members[field].astype(str).str.strip().eq("").any():
+            raise RuntimeError(f"Industry intervals contain missing {field}")
+    for field in ["in_date", "out_date"]:
+        members[field] = members[field].astype("string").str.strip().replace("", pd.NA)
+        present = members[field].dropna()
+        if not present.str.fullmatch(r"\d{8}").all():
+            raise RuntimeError(f"Invalid {field} format")
+        pd.to_datetime(present, format="%Y%m%d", errors="raise")
+    if members.loc[members["is_new"] == "N", "out_date"].isna().any():
+        raise RuntimeError("Historical industry intervals must have out_date")
+    if (members["out_date"].notna() & (members["in_date"] > members["out_date"])).any():
+        raise RuntimeError("Industry interval ends before it starts")
+    if members.groupby("l1_code")["l1_name"].nunique().gt(1).any():
+        raise RuntimeError("An L1 code maps to multiple names")
+    return members[["ts_code", "l1_code", "l1_name", "in_date", "out_date"]].drop_duplicates()
 
-    best = members.groupby("ts_code", sort=False).head(1)
-    top_rank = members.merge(
-        best[["ts_code", "current_priority", "last_date", "in_date"]],
-        on=["ts_code", "current_priority", "last_date", "in_date"],
-        how="inner",
-    )
-    ambiguous = top_rank.groupby("ts_code")["l1_name"].nunique()
-    ambiguous = ambiguous[ambiguous > 1]
-    if not ambiguous.empty:
-        raise RuntimeError(
-            f"Ambiguous latest L1 industry for {len(ambiguous):,} stocks: "
-            f"{', '.join(ambiguous.index[:10])}"
+
+def rebuild_industry(connection: duckdb.DuckDBPyConnection, intervals: pd.DataFrame) -> None:
+    """Validate the daily expansion before atomically replacing industry."""
+    connection.register("industry_intervals_batch", intervals)
+    try:
+        connection.execute("BEGIN TRANSACTION")
+        connection.execute(
+            """
+            CREATE TEMP TABLE industry_daily_stage AS
+            SELECT m.trade_date, m.ts_code, MIN(i.l1_name) AS sw_l1_industry,
+                   COUNT(DISTINCT i.l1_code) AS industry_count
+            FROM market m
+            LEFT JOIN industry_intervals_batch i
+              ON m.ts_code = i.ts_code
+             AND m.trade_date >= i.in_date
+             AND (i.out_date IS NULL OR m.trade_date <= i.out_date)
+            GROUP BY m.trade_date, m.ts_code
+            """
         )
-
-    result = pd.DataFrame({"ts_code": sorted(universe)})
-    result = result.merge(
-        best[["ts_code", "l1_name"]].rename(columns={"l1_name": "sw_l1_industry"}),
-        on="ts_code",
-        how="left",
-        validate="one_to_one",
-    )
-    return result
+        conflicts = connection.execute(
+            "SELECT trade_date, ts_code FROM industry_daily_stage "
+            "WHERE industry_count > 1 LIMIT 10"
+        ).fetchall()
+        if conflicts:
+            raise RuntimeError(f"Overlapping L1 memberships on market dates: {conflicts}")
+        total_rows, classified_rows = connection.execute(
+            "SELECT COUNT(*), COUNT(sw_l1_industry) FROM industry_daily_stage"
+        ).fetchone()
+        if total_rows != connection.execute("SELECT COUNT(*) FROM market").fetchone()[0]:
+            raise RuntimeError("Daily industry keys do not match market")
+        if not classified_rows:
+            raise RuntimeError("No market rows could be classified")
+        connection.execute("DROP TABLE IF EXISTS industry")
+        connection.execute(
+            """
+            CREATE TABLE industry (
+                trade_date VARCHAR NOT NULL,
+                ts_code VARCHAR NOT NULL,
+                sw_l1_industry VARCHAR,
+                PRIMARY KEY (trade_date, ts_code)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO industry SELECT trade_date, ts_code, sw_l1_industry "
+            "FROM industry_daily_stage ORDER BY trade_date, ts_code"
+        )
+        connection.execute("DROP TABLE industry_daily_stage")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.unregister("industry_intervals_batch")
 
 
 def main() -> None:
@@ -155,26 +200,9 @@ def main() -> None:
             time.sleep(REQUEST_INTERVAL_SECONDS)
 
         members = pd.concat(frames, ignore_index=True)
-        result = latest_industries(members, universe)
-        connection.register("industry_batch", result)
-        try:
-            connection.execute("BEGIN TRANSACTION")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS industry (
-                    ts_code VARCHAR PRIMARY KEY,
-                    sw_l1_industry VARCHAR
-                )
-                """
-            )
-            connection.execute("DELETE FROM industry")
-            connection.execute("INSERT INTO industry SELECT * FROM industry_batch")
-            connection.execute("COMMIT")
-        except Exception:
-            connection.execute("ROLLBACK")
-            raise
-        finally:
-            connection.unregister("industry_batch")
+        intervals = industry_intervals(members, universe)
+        print(f"Expanding {len(intervals):,} membership intervals onto market dates", flush=True)
+        rebuild_industry(connection, intervals)
 
         connection.execute("CHECKPOINT")
         total_rows, classified_rows, industry_count = connection.execute(
@@ -184,7 +212,7 @@ def main() -> None:
             """
         ).fetchone()
         print(
-            f"Done. industry contains {total_rows:,} stocks; "
+            f"Done. industry contains {total_rows:,} stock/trading-day rows; "
             f"{classified_rows:,} classified into {industry_count:,} SW2021 L1 industries; "
             f"{total_rows - classified_rows:,} unclassified."
         )

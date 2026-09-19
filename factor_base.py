@@ -20,6 +20,7 @@ class FactorBase(ABC):
         requires_ff3: bool = False,
         minute_fields: list[str] | None = None,
         minute_window_days: int = 1,
+        factor_fields: list[str] | None = None,
     ):
         window_match = re.fullmatch(r"([1-9]\d*)([DMY])", window)
         if window_match is None:
@@ -32,6 +33,7 @@ class FactorBase(ABC):
         self.index_code = index_code
         self.requires_ff3 = requires_ff3
         self.minute_fields = list(minute_fields or [])
+        self.factor_fields = list(factor_fields or [])
         if (isinstance(minute_window_days, bool)
                 or not isinstance(minute_window_days, (int, np.integer))
                 or minute_window_days < 1):
@@ -46,16 +48,31 @@ class FactorBase(ABC):
         ic_series = []
         group_returns = []
 
-        missing_fields = [
+        # 查找缺失字段，避免在计算中途报错
+        missing_fields = []
+        missing_fields.extend(
             field
             for field in self.data_fields
             if field not in data_manager.market_columns
             and field not in data_manager.financial_columns
-        ]
+        )
+        if self.minute_fields:
+            missing_fields.extend(
+                field
+                for field in self.minute_fields
+                if field not in data_manager.minute_columns
+            )
+        if self.factor_fields:
+            missing_fields.extend(
+                field
+                for field in self.factor_fields
+                if field not in data_manager.factor_columns
+            )
         if missing_fields:
             raise ValueError(
-                f"market and financial tables do not contain fields: {missing_fields}"
+                f"Missing required fields in data_manager: {missing_fields}"
             )
+
         market_field_names = [
             field
             for field in self.data_fields
@@ -64,18 +81,8 @@ class FactorBase(ABC):
         financial_field_names = [
             field
             for field in self.data_fields
-            if field not in data_manager.market_columns
-            and field in data_manager.financial_columns
+            if field in data_manager.financial_columns
         ]
-        minute_field_names = self.minute_fields
-        unknown_minute_fields = (
-            set(minute_field_names) - (data_manager.minute_columns - {"trade_time", "ts_code"})
-            if minute_field_names else set()
-        )
-        if unknown_minute_fields:
-            raise ValueError(f"Unknown minute fields: {sorted(unknown_minute_fields)}")
-        if len(set(minute_field_names)) != len(minute_field_names):
-            raise ValueError("Duplicate minute fields")
 
         all_signal_dates = data_manager.calender.loc[
             data_manager.calender["is_open"] == 1, "cal_date"
@@ -96,7 +103,7 @@ class FactorBase(ABC):
                 self.window,
             )
 
-        # 同一成分股快照区间内，行情和财务数据各自最多读取一次。
+        # 同一成分股快照区间内，行情、财务和基础因子各自最多读取一次。
         for signal_dates, constituent_symbols in data_manager.get_constituent_periods():
             data_parts = []
             minute_cache = {}
@@ -119,13 +126,11 @@ class FactorBase(ABC):
                         constituent_symbols,
                     )
                 )
-
-            if data_parts:
-                input_data = pd.concat(data_parts, axis=1).reindex(
-                    columns=self.data_fields
+            if self.factor_fields:
+                factor_values = data_manager.get_factor_data(
+                    signal_dates, self.window, self.factor_fields, constituent_symbols
                 )
-            else:
-                input_data = pd.DataFrame()
+
             return_ratios = data_manager.get_eval_data(
                 signal_dates,
                 forward_days,
@@ -133,6 +138,13 @@ class FactorBase(ABC):
             )
 
             # 每个字段只在区间级别转换一次，子类可直接按日期和股票切片。
+            if data_parts:
+                input_data = pd.concat(data_parts, axis=1).reindex(
+                    columns=self.data_fields
+                )
+            else:
+                input_data = pd.DataFrame()
+
             market_fields = {}
             for field in input_data.columns:
                 field_data = input_data[field].unstack("ts_code").sort_index()
@@ -141,6 +153,11 @@ class FactorBase(ABC):
                 market_fields[field] = field_data
             market_fields.update(shared_data)
 
+            factor_fields = {}
+            if self.factor_fields:
+                for field in self.factor_fields:
+                    factor_fields[field] = factor_values[field].unstack("ts_code").sort_index()
+
             for date in signal_dates:
                 # 名义成分股在区间内固定，ST 和停牌过滤仍以当天状态为准。
                 symbols = data_manager.get_symbols(date)
@@ -148,10 +165,7 @@ class FactorBase(ABC):
                     date,
                     self.window,
                 )
-                daily_fields = {
-                    field: values.loc[:date] for field, values in market_fields.items()
-                }
-                if minute_field_names:
+                if self.minute_fields:
                     position = data_manager.open_date_positions[date]
                     read_days = self.minute_window_days
                     if minute_cache:
@@ -159,7 +173,7 @@ class FactorBase(ABC):
                         read_days = min(read_days, position - last_position)
                     # 首次完整窗口由数据管理器校验；后续只读取缓存之后的新交易日。
                     minute_data = data_manager.get_minute_data(
-                        date, minute_field_names, constituent_symbols, window_days=read_days
+                        date, self.minute_fields, constituent_symbols, window_days=read_days
                     )
                     minute_dates = data_manager.open_dates[
                         position - self.minute_window_days + 1:position + 1
@@ -178,18 +192,28 @@ class FactorBase(ABC):
                     # 空交易日也保留在元数据中，因子按该日历对齐后再做跨日统计。
                     minute_data.attrs["trade_dates"] = tuple(minute_dates)
                     present = minute_cache[date].index.get_level_values("ts_code").intersection(symbols).nunique()
-                    signal = self.calculate_daily_factor(
-                        date, symbols, daily_fields,
-                        history_start, minute_data=minute_data,
-                    ).reindex(symbols)
+
+                daily_fields = {
+                    field: values.loc[:date] for field, values in market_fields.items()
+                }
+                daily_kwargs = {}
+                if self.factor_fields:
+                    daily_kwargs["factor_data"] = {
+                        field: values.loc[:date].reindex(columns=symbols)
+                        for field, values in factor_fields.items()
+                    }
+                if self.minute_fields:
+                    daily_kwargs["minute_data"] = minute_data
+
+                signal = self.calculate_daily_factor(
+                    date, symbols, daily_fields, history_start, **daily_kwargs
+                ).reindex(symbols)
+                daily_kwargs.clear()
+                if self.minute_fields:
                     print(f"MINUTE {date}: window={minute_dates[0]}..{date} "
                           f"target={len(symbols)} present={present} valid={int(np.isfinite(signal).sum())}",
                           flush=True)
                     del minute_data
-                else:
-                    signal = self.calculate_daily_factor(
-                        date, symbols, daily_fields, history_start
-                    ).reindex(symbols)
                 signal.name = date
                 signals.append(signal)
 
@@ -354,10 +378,14 @@ class FactorBase(ABC):
         history_start: str,
         *,
         minute_data: pd.DataFrame | None = None,
+        factor_data: dict[str, pd.DataFrame] | None = None,
     ) -> pd.Series:
         """返回日频股票截面。
 
         日频子类沿用原签名；声明 minute_fields 的子类接收 minute_data 关键字。
+        声明 factor_fields 的子类接收 factor_data：按交易日补齐、截止当天、
+        列对齐 symbols 的基础因子矩阵；用 history_start:trade_date 截取窗口，
+        恰好 N 日（含当天）用 tail(N)，缺失值保持 NaN。
         分钟长表索引为 (trade_time, ts_code)，窗口含当天共 minute_window_days
         个交易日；attrs['trade_dates'] 包含缺数据的交易日。价格及单位保持原样。
         """

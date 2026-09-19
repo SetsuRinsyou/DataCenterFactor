@@ -32,6 +32,10 @@ def parse_args() -> argparse.Namespace:
         help="保存因子值的新 DuckDB 文件路径",
     )
     parser.add_argument(
+        "--factor-db",
+        help="基础因子数据库路径，默认使用 output-db，仅声明 factor_fields 时读取",
+    )
+    parser.add_argument(
         "--minute-db-path",
         default=str(SCRIPT_ROOT / "data" / "market_1min.duckdb"),
         help="分钟行情数据库路径，仅分钟因子使用",
@@ -225,6 +229,7 @@ def main() -> None:
     )
     factor_name = f"{factor.__class__.__name__}_{factor.window}"
     minute_db = Path(args.minute_db_path).expanduser().resolve() if factor.minute_fields else None
+    factor_db = Path(args.factor_db or output_db).expanduser().resolve() if factor.factor_fields else None
     if minute_db is not None and output_db == minute_db:
         raise ValueError("output-db must be different from the minute database")
     print(f"因子: {factor_name}")
@@ -238,6 +243,7 @@ def main() -> None:
         args.start_date,
         args.end_date,
         minute_db_path=str(minute_db) if minute_db is not None else None,
+        factor_db_path=str(factor_db) if factor_db is not None else None,
     )
     try:
         signal_frame, rank_ic, group_returns = factor.compute_eval(

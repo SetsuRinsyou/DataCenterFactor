@@ -1,4 +1,5 @@
 import re
+from pathlib import Path
 import duckdb
 import pandas as pd
 import numpy as np
@@ -9,15 +10,18 @@ from bisect import bisect_right
 class DataManager(object):
 
     def __init__(self, db_path: str, pool_name: str, start_date: str, end_date: str,
-                 minute_db_path: str | None = None):
+                 minute_db_path: str | None = None, factor_db_path: str | None = None):
         self.connection = None
         self.minute_connection = None
+        self.factor_connection = None
         self.market_columns = set()
         self.financial_columns = set()
         self.minute_columns = set()
+        self.factor_columns = set()
 
         try:
-            self.initialize(db_path, pool_name, start_date, end_date, minute_db_path)
+            self.initialize(db_path, pool_name, start_date, end_date, minute_db_path,
+                            factor_db_path)
         except BaseException:
             try:
                 self.close()
@@ -26,7 +30,7 @@ class DataManager(object):
             raise
 
     def initialize(self, db_path: str, pool_name: str, start_date: str, end_date: str,
-                    minute_db_path: str | None = None):
+                    minute_db_path: str | None = None, factor_db_path: str | None = None):
         """初始化数据库连接、字段、交易日历和股票池。"""
         if pool_name != "zz500":
             raise ValueError("pool_name must be 'zz500'")
@@ -37,12 +41,22 @@ class DataManager(object):
         self.connection = duckdb.connect(db_path, read_only=True)
         if minute_db_path is not None:
             self.minute_connection = duckdb.connect(minute_db_path, read_only=True)
+        if factor_db_path is not None:
+            if not Path(factor_db_path).is_file():
+                raise FileNotFoundError(f"factor database does not exist: {factor_db_path}")
+            self.factor_connection = duckdb.connect(factor_db_path, read_only=True)
 
-        # 检验数据行情库中是否存在所需的表和字段
+        # 检验各数据源中所需的表和字段。
         self.market_columns = {row[1] for row in self.connection.execute("PRAGMA table_info('market')").fetchall()}
         self.financial_columns = {row[1] for row in self.connection.execute("PRAGMA table_info('financial')").fetchall()}
         if self.minute_connection is not None:
             self.minute_columns = {row[1] for row in self.minute_connection.execute("PRAGMA table_info('market_1min')").fetchall()}
+        if self.factor_connection is not None:
+            self.factor_columns = {
+                row[1] for row in self.factor_connection.execute(
+                    "PRAGMA table_info('factor')"
+                ).fetchall()
+            } - {"trade_date", "code"}
 
         # 检查当前数据库支持的最早和最晚时间
         self.min_date, self.max_date = self.connection.execute("SELECT MIN(cal_date), MAX(cal_date) FROM calender").fetchone()
@@ -65,13 +79,17 @@ class DataManager(object):
         self.excluded_symbols = self.get_excluded_symbols(start_date, end_date)
 
     def close(self):
-        """关闭两个数据源；重复关闭无副作用。"""
+        """关闭所有数据源；重复关闭无副作用。"""
         try:
             if self.minute_connection is not None:
                 self.minute_connection.close()
         finally:
-            if self.connection is not None:
-                self.connection.close()
+            try:
+                if self.factor_connection is not None:
+                    self.factor_connection.close()
+            finally:
+                if self.connection is not None:
+                    self.connection.close()
 
     def __enter__(self):
         return self
@@ -306,6 +324,49 @@ class DataManager(object):
             data[price_columns] = data[price_columns].mul(data["adj_factor"], axis=0)
             data = data.drop(columns="adj_factor")
         return data.set_index(["trade_date", "ts_code"])
+
+    def get_factor_data(
+        self,
+        trade_dates: list[str],
+        pre_window: str,
+        factor_fields: list[str],
+        symbols: list[str],
+    ) -> pd.DataFrame:
+        """读取原始因子值，补齐窗口内交易日和请求股票，缺失值保留 NaN。"""
+        if self.factor_connection is None:
+            raise ValueError("factor_db_path is required to read factor fields")
+        missing_fields = [field for field in factor_fields if field not in self.factor_columns]
+        if missing_fields:
+            raise ValueError(f"factor table does not contain fields: {missing_fields}")
+        if len(set(factor_fields)) != len(factor_fields):
+            raise ValueError("Duplicate factor fields")
+        if not symbols:
+            raise ValueError("symbols list cannot be empty")
+
+        columns = ["trade_date", "code", *factor_fields]
+        column_sql = ", ".join('"' + field.replace('"', '""') + '"' for field in columns)
+        placeholders = ", ".join("?" for _ in symbols)
+        start_date = self.get_pre_window_start_date(trade_dates[0], pre_window)
+        data = self.factor_connection.execute(
+            f"""
+            SELECT {column_sql} FROM factor
+            WHERE trade_date BETWEEN ? AND ? AND code IN ({placeholders})
+            ORDER BY trade_date, code
+            """,
+            [start_date, trade_dates[-1], *symbols],
+        ).fetchdf()
+        history_dates = [
+            day for day in self.open_dates if start_date <= day <= trade_dates[-1]
+        ]
+        # 保留无记录的交易日，避免下游 rolling/tail 跳过缺失日期。
+        result_index = pd.MultiIndex.from_product(
+            [history_dates, symbols], names=["trade_date", "ts_code"]
+        )
+        return (
+            data.rename(columns={"code": "ts_code"})
+            .set_index(["trade_date", "ts_code"])
+            .reindex(result_index)
+        )
 
     def get_financial_data(
         self,
@@ -626,13 +687,14 @@ class AllStockDataManager(DataManager):
         start_date: str,
         end_date: str,
         minute_db_path: str | None = None,
+        factor_db_path: str | None = None,
     ):
         if pool_name != "all":
             raise ValueError("pool_name must be 'all'")
 
         # 父类仍加载中证500快照，供 get_ff3_factor_data 构造既有口径的
         # SMB/HML；因子评价所用股票池由本类下面两个重写方法决定。
-        super().__init__(db_path, "zz500", start_date, end_date, minute_db_path)
+        super().__init__(db_path, "zz500", start_date, end_date, minute_db_path, factor_db_path)
         self.pool_name = pool_name
         self.all_symbols_by_date = {
             trade_date: list(symbols)
