@@ -21,6 +21,7 @@ class FactorBase(ABC):
         minute_fields: list[str] | None = None,
         minute_window_days: int = 1,
         factor_fields: list[str] | None = None,
+        financial_report_fields: list[str] | None = None,
     ):
         window_match = re.fullmatch(r"([1-9]\d*)([DMY])", window)
         if window_match is None:
@@ -34,6 +35,7 @@ class FactorBase(ABC):
         self.requires_ff3 = requires_ff3
         self.minute_fields = list(minute_fields or [])
         self.factor_fields = list(factor_fields or [])
+        self.financial_report_fields = list(financial_report_fields or [])
         if (isinstance(minute_window_days, bool)
                 or not isinstance(minute_window_days, (int, np.integer))
                 or minute_window_days < 1):
@@ -55,6 +57,9 @@ class FactorBase(ABC):
             for field in self.data_fields
             if field not in data_manager.market_columns
             and field not in data_manager.financial_columns
+            and field not in data_manager.industry_columns
+            and field not in data_manager.analyst_forecast_columns
+            and field not in data_manager.dividend_columns
         )
         if self.minute_fields:
             missing_fields.extend(
@@ -67,6 +72,11 @@ class FactorBase(ABC):
                 field
                 for field in self.factor_fields
                 if field not in data_manager.factor_columns
+            )
+        if self.financial_report_fields:
+            missing_fields.extend(
+                field for field in self.financial_report_fields
+                if field not in data_manager.financial_report_columns
             )
         if missing_fields:
             raise ValueError(
@@ -82,6 +92,21 @@ class FactorBase(ABC):
             field
             for field in self.data_fields
             if field in data_manager.financial_columns
+        ]
+        industry_field_names = [
+            field
+            for field in self.data_fields
+            if field in data_manager.industry_columns
+        ]
+        analyst_forecast_field_names = [
+            field
+            for field in self.data_fields
+            if field in data_manager.analyst_forecast_columns
+        ]
+        dividend_field_names = [
+            field
+            for field in self.data_fields
+            if field in data_manager.dividend_columns
         ]
 
         all_signal_dates = data_manager.calender.loc[
@@ -103,10 +128,18 @@ class FactorBase(ABC):
                 self.window,
             )
 
-        # 同一成分股快照区间内，行情、财务和基础因子各自最多读取一次。
+        # 同一成分股快照区间内，每类日频数据各自最多读取一次。
         for signal_dates, constituent_symbols in data_manager.get_constituent_periods():
             data_parts = []
             minute_cache = {}
+            report_values = None
+            report_dates = set()
+            if self.financial_report_fields:
+                report_values = data_manager.get_financial_report_data(
+                    signal_dates, self.window,
+                    self.financial_report_fields, constituent_symbols,
+                )
+                report_dates = set(report_values.index.get_level_values("trade_date"))
 
             if market_field_names:
                 data_parts.append(
@@ -123,6 +156,41 @@ class FactorBase(ABC):
                         signal_dates,
                         self.window,
                         financial_field_names,
+                        constituent_symbols,
+                    )
+                )
+            if industry_field_names:
+                data_parts.append(
+                    data_manager.get_industry_data(
+                        signal_dates,
+                        self.window,
+                        industry_field_names,
+                        constituent_symbols,
+                    )
+                )
+            if analyst_forecast_field_names:
+                analyst_window = (
+                    self.window
+                    if any(
+                        field.startswith("forecast_revision_")
+                        for field in analyst_forecast_field_names
+                    )
+                    else "1D"
+                )
+                data_parts.append(
+                    data_manager.get_analyst_forecast_data(
+                        signal_dates,
+                        analyst_window,
+                        analyst_forecast_field_names,
+                        constituent_symbols,
+                    )
+                )
+            if dividend_field_names:
+                data_parts.append(
+                    data_manager.get_dividend_data(
+                        signal_dates,
+                        self.window,
+                        dividend_field_names,
                         constituent_symbols,
                     )
                 )
@@ -204,6 +272,12 @@ class FactorBase(ABC):
                     }
                 if self.minute_fields:
                     daily_kwargs["minute_data"] = minute_data
+                if report_values is not None:
+                    daily_kwargs["financial_report_data"] = (
+                        report_values.xs(date, level="trade_date")
+                        if date in report_dates
+                        else report_values.iloc[:0].droplevel("trade_date")
+                    )
 
                 signal = self.calculate_daily_factor(
                     date, symbols, daily_fields, history_start, **daily_kwargs
@@ -379,6 +453,7 @@ class FactorBase(ABC):
         *,
         minute_data: pd.DataFrame | None = None,
         factor_data: dict[str, pd.DataFrame] | None = None,
+        financial_report_data: pd.DataFrame | None = None,
     ) -> pd.Series:
         """返回日频股票截面。
 
@@ -386,6 +461,8 @@ class FactorBase(ABC):
         声明 factor_fields 的子类接收 factor_data：按交易日补齐、截止当天、
         列对齐 symbols 的基础因子矩阵；用 history_start:trade_date 截取窗口，
         恰好 N 日（含当天）用 tail(N)，缺失值保持 NaN。
+        声明 financial_report_fields 的子类接收 financial_report_data：
+        索引为 (report_end_date, ts_code)，只含信号日前已披露事件。
         分钟长表索引为 (trade_time, ts_code)，窗口含当天共 minute_window_days
         个交易日；attrs['trade_dates'] 包含缺数据的交易日。价格及单位保持原样。
         """

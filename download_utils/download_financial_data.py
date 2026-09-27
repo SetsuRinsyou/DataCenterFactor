@@ -22,6 +22,7 @@ FIRST_PERIOD = "20030930"
 REQUEST_INTERVAL_SECONDS = 1.0
 MAX_RETRIES = 5
 RF_TS_CODE = "204001.SH"
+VIP_PAGE_LIMIT = 6000
 
 META_FIELDS = [
     "ts_code",
@@ -32,7 +33,7 @@ META_FIELDS = [
     "comp_type",
     "update_flag",
 ]
-INCOME_FIELDS = [
+BASE_INCOME_FIELDS = [
     "revenue",
     "oper_cost",
     "biz_tax_surchg",
@@ -41,7 +42,10 @@ INCOME_FIELDS = [
     "rd_exp",
     "n_income_attr_p",
 ]
-BALANCE_FIELDS = [
+CNE6_INCOME_FIELDS = ["ebit"]
+INCOME_FIELDS = [*BASE_INCOME_FIELDS, *CNE6_INCOME_FIELDS]
+
+BASE_BALANCE_FIELDS = [
     "total_assets",
     "total_hldr_eqy_exc_min_int",
     "money_cap",
@@ -59,17 +63,47 @@ BALANCE_FIELDS = [
     "lease_liab",
     "defer_tax_liab",
 ]
-CASHFLOW_FIELDS = [
+CNE6_BALANCE_FIELDS = ["oth_eqt_tools_p_shr", "minority_int"]
+BALANCE_FIELDS = [*BASE_BALANCE_FIELDS, *CNE6_BALANCE_FIELDS]
+
+DEPRECIATION_CASHFLOW_FIELDS = [
     "depr_fa_coga_dpba",
     "amort_intang_assets",
     "lt_amort_deferred_exp",
     "use_right_asset_dep",
 ]
+CNE6_CASHFLOW_FIELDS = [
+    "n_cashflow_act",
+    "c_pay_acq_const_fiolta",
+    "n_cashflow_inv_act",
+    "n_incr_cash_cash_equ",
+]
+CASHFLOW_FIELDS = [*DEPRECIATION_CASHFLOW_FIELDS, *CNE6_CASHFLOW_FIELDS]
 GROWTH_FIELDS = ["tr_yoy", "dt_netprofit_yoy", "ocf_yoy"]
 
 INCOME_OUTPUTS = [f"{column}_ttm" for column in INCOME_FIELDS]
 BALANCE_OUTPUTS = [f"{column}_mrq" for column in BALANCE_FIELDS]
 CASHFLOW_OUTPUTS = [f"{column}_ttm" for column in CASHFLOW_FIELDS]
+BASE_INCOME_OUTPUTS = [f"{column}_ttm" for column in BASE_INCOME_FIELDS]
+BASE_BALANCE_OUTPUTS = [f"{column}_mrq" for column in BASE_BALANCE_FIELDS]
+DEPRECIATION_CASHFLOW_OUTPUTS = [
+    f"{column}_ttm" for column in DEPRECIATION_CASHFLOW_FIELDS
+]
+CNE6_FINANCIAL_COLUMNS = [
+    "ebit_ttm",
+    "n_cashflow_act_ttm",
+    "c_pay_acq_const_fiolta_ttm",
+    "oth_eqt_tools_p_shr_mrq",
+    "minority_int_mrq",
+]
+CNE6_CASHFLOW_FINANCIAL_COLUMNS = [
+    "n_cashflow_inv_act_ttm",
+    "n_incr_cash_cash_equ_ttm",
+]
+ALL_CNE6_FINANCIAL_COLUMNS = [
+    *CNE6_FINANCIAL_COLUMNS,
+    *CNE6_CASHFLOW_FINANCIAL_COLUMNS,
+]
 FINANCIAL_COLUMNS = [
     "trade_date",
     "ts_code",
@@ -79,14 +113,20 @@ FINANCIAL_COLUMNS = [
     "cf_effective_date",
     "fi_effective_date",
     "comp_type",
-    *INCOME_OUTPUTS,
-    *BALANCE_OUTPUTS,
-    *CASHFLOW_OUTPUTS,
+    *BASE_INCOME_OUTPUTS,
+    *BASE_BALANCE_OUTPUTS,
+    *DEPRECIATION_CASHFLOW_OUTPUTS,
     "daa_ttm",
     "depreciation_ttm_pit",
     "rf_ts_code",
     "gc001_weight",
     *GROWTH_FIELDS,
+    *CNE6_FINANCIAL_COLUMNS,
+    *CNE6_CASHFLOW_FINANCIAL_COLUMNS,
+]
+PRE_CNE6_FINANCIAL_COLUMNS = [
+    column for column in FINANCIAL_COLUMNS
+    if column not in ALL_CNE6_FINANCIAL_COLUMNS
 ]
 
 SOURCE_CONFIG = {
@@ -116,6 +156,129 @@ SOURCE_CONFIG = {
     },
 }
 
+REPORT_EVENT_FIELDS = list(dict.fromkeys([
+    *INCOME_OUTPUTS, *BALANCE_OUTPUTS, *CASHFLOW_OUTPUTS,
+    "daa_ttm", *GROWTH_FIELDS,
+]))
+REPORT_EVENT_COLUMNS = [
+    "ts_code", "report_end_date", "source_type", "effective_date",
+    "comp_type", *REPORT_EVENT_FIELDS,
+]
+
+
+def create_financial_report_event_table(connection: duckdb.DuckDBPyConnection) -> None:
+    """Create and validate the sparse, source-specific quarterly event table."""
+    fields_sql = ",\n            ".join(
+        f'"{field}" DOUBLE' for field in REPORT_EVENT_FIELDS
+    )
+    connection.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS financial_report_event (
+            ts_code VARCHAR NOT NULL,
+            report_end_date VARCHAR NOT NULL,
+            source_type VARCHAR NOT NULL,
+            effective_date VARCHAR NOT NULL,
+            comp_type VARCHAR,
+            {fields_sql},
+            PRIMARY KEY (ts_code, report_end_date, source_type, effective_date)
+        )
+        """
+    )
+    actual = [row[1] for row in connection.execute(
+        "PRAGMA table_info('financial_report_event')"
+    ).fetchall()]
+    if actual != REPORT_EVENT_COLUMNS:
+        raise RuntimeError("financial_report_event schema differs from expected columns")
+    primary_key = [
+        row[1] for row in sorted(
+            connection.execute("PRAGMA table_info('financial_report_event')").fetchall(),
+            key=lambda row: row[5] or 99,
+        ) if row[5]
+    ]
+    if primary_key != REPORT_EVENT_COLUMNS[:4]:
+        raise RuntimeError("financial_report_event primary key differs from expected")
+
+
+def prepare_financial_report_events(source: str, frame: pd.DataFrame) -> pd.DataFrame:
+    """Convert normalized Tushare rows to report-period events."""
+    if source == "income":
+        events = build_ttm_events(frame, INCOME_FIELDS, INCOME_OUTPUTS, set(frame["end_date"]))
+    elif source == "balancesheet":
+        events = build_balance_events(frame, set(frame["end_date"]))
+    elif source == "cashflow":
+        events = build_ttm_events(frame, CASHFLOW_FIELDS, CASHFLOW_OUTPUTS, set(frame["end_date"]))
+    elif source == "fina_indicator":
+        events = build_indicator_events(frame, set(frame["end_date"]))
+    else:
+        raise ValueError(f"unknown financial source: {source}")
+    events["source_type"] = source
+    result = events.reindex(columns=REPORT_EVENT_COLUMNS)
+    if result.duplicated(REPORT_EVENT_COLUMNS[:4]).any():
+        raise RuntimeError(f"duplicate {source} report event key")
+    return result
+
+
+def upsert_financial_report_events(
+    connection: duckdb.DuckDBPyConnection, events: pd.DataFrame, batch_size: int = 20000
+) -> None:
+    """Write each batch atomically; reruns update matching events without deletion."""
+    if events.empty:
+        return
+    keys = REPORT_EVENT_COLUMNS[:4]
+    if events[keys].isna().any().any() or events.duplicated(keys).any():
+        raise ValueError("financial report event keys must be nonnull and unique")
+    if not events["effective_date"].astype(str).str.fullmatch(r"\d{8}").all():
+        raise ValueError("invalid financial report effective_date")
+    quoted = ", ".join(f'"{column}"' for column in REPORT_EVENT_COLUMNS)
+    updates = ", ".join(
+        f'"{column}" = EXCLUDED."{column}"'
+        for column in REPORT_EVENT_COLUMNS[4:]
+    )
+    for offset in range(0, len(events), batch_size):
+        batch = events.iloc[offset:offset + batch_size]
+        connection.register("report_event_batch", batch)
+        connection.execute("BEGIN TRANSACTION")
+        try:
+            connection.execute(
+                f"INSERT INTO financial_report_event ({quoted}) "
+                f"SELECT {quoted} FROM report_event_batch "
+                f"ON CONFLICT (ts_code, report_end_date, source_type, effective_date) "
+                f"DO UPDATE SET {updates}"
+            )
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.unregister("report_event_batch")
+
+
+def sync_financial_report_events(
+    connection: duckdb.DuckDBPyConnection, pro, universe: set[str],
+    market_max_date: str, counters: dict[str, "ApiCounter"]
+) -> None:
+    """Backfill all quarters and all four source types without altering financial."""
+    periods = quarter_periods(FIRST_PERIOD, market_max_date)
+    before = financial_fingerprint(connection, FINANCIAL_COLUMNS)
+    create_financial_report_event_table(connection)
+    for source in SOURCE_CONFIG:
+        raw = fetch_source(
+            pro, source, periods, universe, market_max_date, counters,
+            fill_interior_gaps=False,
+        )
+        events = prepare_financial_report_events(source, raw)
+        upsert_financial_report_events(connection, events)
+        connection.execute("CHECKPOINT")
+        print(f"{source}: {len(events):,} fetched event rows", flush=True)
+    after = financial_fingerprint(connection, FINANCIAL_COLUMNS)
+    if after != before:
+        raise RuntimeError("financial changed during report-event sync")
+    for source, count, first_date, last_date in connection.execute(
+        "SELECT source_type, COUNT(*), MIN(effective_date), MAX(effective_date) "
+        "FROM financial_report_event GROUP BY source_type ORDER BY source_type"
+    ).fetchall():
+        print(f"{source}: {count:,} stored events, {first_date}..{last_date}")
+
 
 @dataclass
 class ApiCounter:
@@ -139,7 +302,11 @@ def previous_year_period(period: str) -> str:
     return f"{int(period[:4]) - 1}{period[4:]}"
 
 
-def create_financial_table(connection: duckdb.DuckDBPyConnection, table_name: str) -> None:
+def create_financial_table(
+    connection: duckdb.DuckDBPyConnection,
+    table_name: str,
+    include_cne6: bool = True,
+) -> None:
     connection.execute(f'DROP TABLE IF EXISTS "{table_name}"')
     connection.execute(
         f"""
@@ -186,10 +353,20 @@ def create_financial_table(connection: duckdb.DuckDBPyConnection, table_name: st
             tr_yoy DOUBLE,
             dt_netprofit_yoy DOUBLE,
             ocf_yoy DOUBLE,
+            ebit_ttm DOUBLE,
+            n_cashflow_act_ttm DOUBLE,
+            c_pay_acq_const_fiolta_ttm DOUBLE,
+            oth_eqt_tools_p_shr_mrq DOUBLE,
+            minority_int_mrq DOUBLE,
+            n_cashflow_inv_act_ttm DOUBLE,
+            n_incr_cash_cash_equ_ttm DOUBLE,
             PRIMARY KEY (trade_date, ts_code)
         )
         """
     )
+    if not include_cne6:
+        for column in ALL_CNE6_FINANCIAL_COLUMNS:
+            connection.execute(f'ALTER TABLE "{table_name}" DROP COLUMN "{column}"')
 
 
 def financial_schema_matches(connection: duckdb.DuckDBPyConnection) -> bool:
@@ -217,7 +394,8 @@ def financial_needs_fix_assets_total(connection: duckdb.DuckDBPyConnection) -> b
     columns = [row[1] for row in info]
     primary_key = [row[1] for row in info if row[5]]
     legacy_columns = [
-        column for column in FINANCIAL_COLUMNS if column != "fix_assets_total_mrq"
+        column for column in PRE_CNE6_FINANCIAL_COLUMNS
+        if column != "fix_assets_total_mrq"
     ]
     return columns == legacy_columns and primary_key == ["trade_date", "ts_code"]
 
@@ -231,7 +409,8 @@ def financial_needs_growth_fields(connection: duckdb.DuckDBPyConnection) -> bool
     columns = [row[1] for row in info]
     primary_key = [row[1] for row in info if row[5]]
     legacy_columns = [
-        column for column in FINANCIAL_COLUMNS if column not in GROWTH_FIELDS
+        column for column in PRE_CNE6_FINANCIAL_COLUMNS
+        if column not in GROWTH_FIELDS
     ]
     return columns == legacy_columns and primary_key == ["trade_date", "ts_code"]
 
@@ -247,7 +426,39 @@ def financial_needs_depreciation_ttm_pit(
     columns = [row[1] for row in info]
     primary_key = [row[1] for row in info if row[5]]
     legacy_columns = [
-        column for column in FINANCIAL_COLUMNS if column != "depreciation_ttm_pit"
+        column for column in PRE_CNE6_FINANCIAL_COLUMNS
+        if column != "depreciation_ttm_pit"
+    ]
+    return columns == legacy_columns and primary_key == ["trade_date", "ts_code"]
+
+
+def financial_needs_cne6_fields(connection: duckdb.DuckDBPyConnection) -> bool:
+    """识别仅缺少五个 CNE6 财务输入字段的旧版 financial 表。"""
+    tables = {row[0] for row in connection.execute("SHOW TABLES").fetchall()}
+    if "financial" not in tables:
+        return False
+    info = connection.execute("PRAGMA table_info('financial')").fetchall()
+    columns = [row[1] for row in info]
+    primary_key = [row[1] for row in info if row[5]]
+    return (
+        columns == PRE_CNE6_FINANCIAL_COLUMNS
+        and primary_key == ["trade_date", "ts_code"]
+    )
+
+
+def financial_needs_cne6_cashflow_fields(
+    connection: duckdb.DuckDBPyConnection,
+) -> bool:
+    """识别仅缺少两个 CNE6 现金流字段的完整 financial 表。"""
+    tables = {row[0] for row in connection.execute("SHOW TABLES").fetchall()}
+    if "financial" not in tables:
+        return False
+    info = connection.execute("PRAGMA table_info('financial')").fetchall()
+    columns = [row[1] for row in info]
+    primary_key = [row[1] for row in info if row[5]]
+    legacy_columns = [
+        column for column in FINANCIAL_COLUMNS
+        if column not in CNE6_CASHFLOW_FINANCIAL_COLUMNS
     ]
     return columns == legacy_columns and primary_key == ["trade_date", "ts_code"]
 
@@ -348,23 +559,42 @@ def fetch_source(
     universe: set[str],
     market_max_date: str,
     counters: dict[str, ApiCounter],
+    fill_interior_gaps: bool = True,
 ) -> pd.DataFrame:
     config = SOURCE_CONFIG[source]
     fields = ",".join([*config["meta"], *config["fields"]])
     frames = []
     for index, period in enumerate(periods, start=1):
-        kwargs = {"period": period, "fields": fields}
-        if source != "fina_indicator":
-            kwargs["report_type"] = "1"
-        frame = call_api(pro, config["vip"], counters, **kwargs)
-        if not frame.empty:
-            frame = frame[frame["ts_code"].astype(str).isin(universe)].copy()
-            frames.append(frame)
-        print(f"[{source} {index}/{len(periods)}] {period}: {len(frame):,} target rows")
+        offset = 0
+        page_count = 0
+        target_rows = 0
+        while True:
+            kwargs = {
+                "period": period,
+                "fields": fields,
+                "limit": VIP_PAGE_LIMIT,
+                "offset": offset,
+            }
+            if source != "fina_indicator":
+                kwargs["report_type"] = "1"
+            frame = call_api(pro, config["vip"], counters, **kwargs)
+            page_count += 1
+            raw_rows = len(frame)
+            if not frame.empty:
+                frame = frame[frame["ts_code"].astype(str).isin(universe)].copy()
+                frames.append(frame)
+                target_rows += len(frame)
+            if raw_rows < VIP_PAGE_LIMIT:
+                break
+            offset += VIP_PAGE_LIMIT
+        print(
+            f"[{source} {index}/{len(periods)}] {period}: "
+            f"{target_rows:,} target rows in {page_count} page(s)"
+        )
 
     raw = concat_source_frames(frames, fields.split(","))
     normalized = normalize_source(raw, source, set(periods), universe)
-    gap_codes = interior_gap_codes(normalized, periods)
+    gap_codes = interior_gap_codes(normalized, periods) if fill_interior_gaps else []
     if gap_codes:
         print(f"{source}: {len(gap_codes):,} stocks have interior quarter gaps; using one fallback call per stock")
     fallback_frames = []
@@ -549,7 +779,9 @@ def build_depreciation_events(
     """合并折旧摊销来源，仅保留能够更新最近有效值的公告事件。"""
     frames = []
     if not cashflow.empty:
-        cashflow_values = cashflow[CASHFLOW_OUTPUTS].sum(axis=1, min_count=1)
+        cashflow_values = cashflow[DEPRECIATION_CASHFLOW_OUTPUTS].sum(
+            axis=1, min_count=1
+        )
         cashflow_events = cashflow[
             ["ts_code", "report_end_date", "effective_date"]
         ].copy()
@@ -800,14 +1032,19 @@ def build_table(
         connection.execute(f"INSERT INTO financial__build {query}")
 
 
-def validate_table(connection: duckdb.DuckDBPyConnection, table_name: str) -> None:
+def validate_table(
+    connection: duckdb.DuckDBPyConnection,
+    table_name: str,
+    expected_columns: list[str] | None = None,
+) -> None:
+    expected_columns = expected_columns or FINANCIAL_COLUMNS
     info = connection.execute(f"PRAGMA table_info('{table_name}')").fetchall()
     columns = [row[1] for row in info]
     primary_key = [row[1] for row in info if row[5]]
-    if columns != FINANCIAL_COLUMNS or primary_key != ["trade_date", "ts_code"]:
+    if columns != expected_columns or primary_key != ["trade_date", "ts_code"]:
         raise RuntimeError(
             f"{table_name} does not have the expected "
-            f"{len(FINANCIAL_COLUMNS)}-column schema and key"
+            f"{len(expected_columns)}-column schema and key"
         )
 
     market_count = connection.execute("SELECT COUNT(*) FROM market").fetchone()[0]
@@ -851,7 +1088,7 @@ def validate_table(connection: duckdb.DuckDBPyConnection, table_name: str) -> No
         )
     print(
         f"Validated {table_name}: {table_count:,} rows, "
-        f"{len(FINANCIAL_COLUMNS)} columns, "
+        f"{len(expected_columns)} columns, "
         f"range {first_date}-{last_date}, exact market key match, no disclosure-date leakage"
     )
 
@@ -904,7 +1141,7 @@ def add_growth_fields(
               AND f.ts_code = d.ts_code
             """
         )
-        validate_table(connection, "financial")
+        validate_table(connection, "financial", PRE_CNE6_FINANCIAL_COLUMNS)
         connection.execute("COMMIT")
     except Exception:
         connection.execute("ROLLBACK")
@@ -939,12 +1176,12 @@ def add_fix_assets_total_column(
     finally:
         connection.unregister("fix_assets_total_events")
 
-    create_financial_table(connection, "financial__build")
+    create_financial_table(connection, "financial__build", include_cne6=False)
     select_columns = [
         "d.fix_assets_total_mrq"
         if column == "fix_assets_total_mrq"
         else f'f."{column}"'
-        for column in FINANCIAL_COLUMNS
+        for column in PRE_CNE6_FINANCIAL_COLUMNS
     ]
     connection.execute(
         f"""
@@ -955,7 +1192,9 @@ def add_fix_assets_total_column(
           USING (trade_date, ts_code)
         """
     )
-    validate_table(connection, "financial__build")
+    validate_table(
+        connection, "financial__build", PRE_CNE6_FINANCIAL_COLUMNS
+    )
 
     connection.execute("BEGIN TRANSACTION")
     try:
@@ -991,12 +1230,12 @@ def add_depreciation_ttm_pit_column(
     finally:
         connection.unregister("depreciation_events")
 
-    create_financial_table(connection, "financial__build")
+    create_financial_table(connection, "financial__build", include_cne6=False)
     select_columns = [
         "d.depreciation_ttm_pit"
         if column == "depreciation_ttm_pit"
         else f'f."{column}"'
-        for column in FINANCIAL_COLUMNS
+        for column in PRE_CNE6_FINANCIAL_COLUMNS
     ]
     connection.execute(
         f"""
@@ -1007,7 +1246,9 @@ def add_depreciation_ttm_pit_column(
           USING (trade_date, ts_code)
         """
     )
-    validate_table(connection, "financial__build")
+    validate_table(
+        connection, "financial__build", PRE_CNE6_FINANCIAL_COLUMNS
+    )
 
     connection.execute("BEGIN TRANSACTION")
     try:
@@ -1020,8 +1261,189 @@ def add_depreciation_ttm_pit_column(
     connection.execute("CHECKPOINT")
 
 
+def financial_fingerprint(
+    connection: duckdb.DuckDBPyConnection,
+    columns: list[str],
+) -> tuple[int, int, int]:
+    """Return row/key/value fingerprints used to prove old columns were preserved."""
+    quoted = ", ".join(f'"{column}"' for column in columns)
+    return connection.execute(
+        f"""
+        SELECT
+            COUNT(*),
+            BIT_XOR(HASH(trade_date, ts_code)),
+            BIT_XOR(HASH({quoted}))
+        FROM financial
+        """
+    ).fetchone()
+
+
+def add_cne6_financial_fields(
+    connection: duckdb.DuckDBPyConnection,
+    income_events: pd.DataFrame,
+    balance_events: pd.DataFrame,
+    cashflow_events: pd.DataFrame,
+) -> None:
+    """Add only the five CNE6 inputs while preserving every existing column."""
+    legacy_columns = PRE_CNE6_FINANCIAL_COLUMNS
+    before = financial_fingerprint(connection, legacy_columns)
+
+    connection.register("cne6_income_events", income_events)
+    connection.register("cne6_balance_events", balance_events)
+    connection.register("cne6_cashflow_events", cashflow_events)
+    try:
+        connection.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE cne6_financial_daily AS
+            SELECT
+                f.trade_date,
+                f.ts_code,
+                i.ebit_ttm,
+                c.n_cashflow_act_ttm,
+                c.c_pay_acq_const_fiolta_ttm,
+                b.oth_eqt_tools_p_shr_mrq,
+                b.minority_int_mrq
+            FROM financial AS f
+            LEFT JOIN cne6_income_events AS i
+              ON f.ts_code = i.ts_code
+             AND f.report_end_date = i.report_end_date
+             AND f.income_effective_date = i.effective_date
+            LEFT JOIN cne6_cashflow_events AS c
+              ON f.ts_code = c.ts_code
+             AND f.report_end_date = c.report_end_date
+             AND f.cf_effective_date = c.effective_date
+            LEFT JOIN cne6_balance_events AS b
+              ON f.ts_code = b.ts_code
+             AND f.report_end_date = b.report_end_date
+             AND f.bs_effective_date = b.effective_date
+            """
+        )
+    finally:
+        connection.unregister("cne6_income_events")
+        connection.unregister("cne6_balance_events")
+        connection.unregister("cne6_cashflow_events")
+
+    connection.execute("BEGIN TRANSACTION")
+    try:
+        for column in CNE6_FINANCIAL_COLUMNS:
+            connection.execute(f'ALTER TABLE financial ADD COLUMN "{column}" DOUBLE')
+        connection.execute(
+            """
+            UPDATE financial AS f
+            SET
+                ebit_ttm = d.ebit_ttm,
+                n_cashflow_act_ttm = d.n_cashflow_act_ttm,
+                c_pay_acq_const_fiolta_ttm = d.c_pay_acq_const_fiolta_ttm,
+                oth_eqt_tools_p_shr_mrq = d.oth_eqt_tools_p_shr_mrq,
+                minority_int_mrq = d.minority_int_mrq
+            FROM cne6_financial_daily AS d
+            WHERE f.trade_date = d.trade_date
+              AND f.ts_code = d.ts_code
+            """
+        )
+        validate_table(
+            connection,
+            "financial",
+            [*PRE_CNE6_FINANCIAL_COLUMNS, *CNE6_FINANCIAL_COLUMNS],
+        )
+        after = financial_fingerprint(connection, legacy_columns)
+        if after != before:
+            raise RuntimeError(
+                "Existing financial rows, keys, or column values changed while "
+                "adding CNE6 inputs"
+            )
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+    connection.execute("CHECKPOINT")
+
+
+def add_cne6_cashflow_fields(
+    connection: duckdb.DuckDBPyConnection,
+    cashflow_events: pd.DataFrame,
+) -> None:
+    """Add two cash-flow TTM inputs without changing existing financial data."""
+    legacy_columns = [
+        column for column in FINANCIAL_COLUMNS
+        if column not in CNE6_CASHFLOW_FINANCIAL_COLUMNS
+    ]
+    before = financial_fingerprint(connection, legacy_columns)
+    event_columns = [
+        "ts_code",
+        "report_end_date",
+        "effective_date",
+        *CNE6_CASHFLOW_FINANCIAL_COLUMNS,
+    ]
+    connection.register(
+        "cne6_cashflow_events",
+        cashflow_events[event_columns],
+    )
+    try:
+        connection.execute(
+            f"""
+            CREATE OR REPLACE TEMP TABLE cne6_cashflow_daily AS
+            SELECT
+                f.trade_date,
+                f.ts_code,
+                {', '.join(f'c.{column}' for column in CNE6_CASHFLOW_FINANCIAL_COLUMNS)}
+            FROM financial AS f
+            LEFT JOIN cne6_cashflow_events AS c
+              ON f.ts_code = c.ts_code
+             AND f.report_end_date = c.report_end_date
+             AND f.cf_effective_date = c.effective_date
+            """
+        )
+    finally:
+        connection.unregister("cne6_cashflow_events")
+
+    connection.execute("BEGIN TRANSACTION")
+    try:
+        for column in CNE6_CASHFLOW_FINANCIAL_COLUMNS:
+            connection.execute(f'ALTER TABLE financial ADD COLUMN "{column}" DOUBLE')
+        connection.execute(
+            f"""
+            UPDATE financial AS f
+            SET {', '.join(f'{column} = d.{column}' for column in CNE6_CASHFLOW_FINANCIAL_COLUMNS)}
+            FROM cne6_cashflow_daily AS d
+            WHERE f.trade_date = d.trade_date
+              AND f.ts_code = d.ts_code
+            """
+        )
+        validate_table(connection, "financial")
+        premature = connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM financial
+            WHERE ({' OR '.join(f'{column} IS NOT NULL' for column in CNE6_CASHFLOW_FINANCIAL_COLUMNS)})
+              AND (cf_effective_date IS NULL OR trade_date <= cf_effective_date)
+            """
+        ).fetchone()[0]
+        if premature:
+            raise RuntimeError(
+                f"financial contains {premature:,} new cash-flow values before "
+                "their disclosure date"
+            )
+        after = financial_fingerprint(connection, legacy_columns)
+        if after != before:
+            raise RuntimeError(
+                "Existing financial rows, keys, or column values changed while "
+                "adding CNE6 cash-flow inputs"
+            )
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+    connection.execute("CHECKPOINT")
+
+
 def report_coverage(connection: duckdb.DuckDBPyConnection) -> None:
-    value_columns = FINANCIAL_COLUMNS[2:]
+    actual_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info('financial')").fetchall()
+    }
+    value_columns = [
+        column for column in FINANCIAL_COLUMNS[2:] if column in actual_columns
+    ]
     aggregates = []
     for column in value_columns:
         aggregates.extend(
@@ -1042,7 +1464,7 @@ def report_coverage(connection: duckdb.DuckDBPyConnection) -> None:
             f"missing={missing_rate:.2%}"
         )
 
-    early_columns = [*CASHFLOW_OUTPUTS, "daa_ttm"]
+    early_columns = [*DEPRECIATION_CASHFLOW_OUTPUTS, "daa_ttm"]
     early = connection.execute(
         "SELECT " + ", ".join(f"COUNT({column})" for column in early_columns) +
         " FROM financial WHERE trade_date < '20100101'"
@@ -1183,6 +1605,8 @@ def run_self_tests() -> None:
             "('20240430', 'TEST.SH'), ('20240501', 'TEST.SH')"
         )
         create_financial_table(connection, "financial")
+        for column in ALL_CNE6_FINANCIAL_COLUMNS:
+            connection.execute(f'ALTER TABLE financial DROP COLUMN "{column}"')
         for column in GROWTH_FIELDS:
             connection.execute(f"ALTER TABLE financial DROP COLUMN {column}")
         connection.execute(
@@ -1211,17 +1635,104 @@ def run_self_tests() -> None:
             ("20240430", None, None, None, None),
             ("20240501", "20240430", 1.0, 2.0, 3.0),
         ]
+
+        connection.execute(
+            """
+            UPDATE financial
+            SET income_effective_date = '20240430',
+                bs_effective_date = '20240430',
+                cf_effective_date = '20240430'
+            WHERE trade_date = '20240501'
+            """
+        )
+        cne6_income = pd.DataFrame(
+            [{
+                "ts_code": "TEST.SH",
+                "report_end_date": "20240331",
+                "effective_date": "20240430",
+                "ebit_ttm": 11.0,
+            }]
+        )
+        cne6_balance = pd.DataFrame(
+            [{
+                "ts_code": "TEST.SH",
+                "report_end_date": "20240331",
+                "effective_date": "20240430",
+                "oth_eqt_tools_p_shr_mrq": None,
+                "minority_int_mrq": 12.0,
+            }]
+        )
+        cne6_cashflow = pd.DataFrame(
+            [{
+                "ts_code": "TEST.SH",
+                "report_end_date": "20240331",
+                "effective_date": "20240430",
+                "n_cashflow_act_ttm": 13.0,
+                "c_pay_acq_const_fiolta_ttm": 14.0,
+                "n_cashflow_inv_act_ttm": 15.0,
+                "n_incr_cash_cash_equ_ttm": 16.0,
+            }]
+        )
+        add_cne6_financial_fields(
+            connection, cne6_income, cne6_balance, cne6_cashflow
+        )
+        cne6_result = connection.execute(
+            "SELECT trade_date, ebit_ttm, n_cashflow_act_ttm, "
+            "c_pay_acq_const_fiolta_ttm, oth_eqt_tools_p_shr_mrq, "
+            "minority_int_mrq FROM financial ORDER BY trade_date"
+        ).fetchall()
+        assert cne6_result == [
+            ("20240430", None, None, None, None, None),
+            ("20240501", 11.0, 13.0, 14.0, None, 12.0),
+        ]
+        assert financial_needs_cne6_cashflow_fields(connection)
+        add_cne6_cashflow_fields(connection, cne6_cashflow)
+        cashflow_result = connection.execute(
+            "SELECT trade_date, n_cashflow_inv_act_ttm, "
+            "n_incr_cash_cash_equ_ttm FROM financial ORDER BY trade_date"
+        ).fetchall()
+        assert cashflow_result == [
+            ("20240430", None, None),
+            ("20240501", 15.0, 16.0),
+        ]
+        create_financial_report_event_table(connection)
+        sample = pd.DataFrame([
+            {"ts_code": "TEST.SH", "report_end_date": "20231231",
+             "source_type": "income", "effective_date": "20240430",
+             "revenue_ttm": 10.0},
+            {"ts_code": "TEST.SH", "report_end_date": "20231231",
+             "source_type": "income", "effective_date": "20240502",
+             "revenue_ttm": 12.0},
+        ]).reindex(columns=REPORT_EVENT_COLUMNS)
+        upsert_financial_report_events(connection, sample)
+        sample.loc[0, "revenue_ttm"] = 11.0
+        upsert_financial_report_events(connection, sample)
+        assert connection.execute(
+            "SELECT effective_date, revenue_ttm FROM financial_report_event "
+            "ORDER BY effective_date"
+        ).fetchall() == [("20240430", 11.0), ("20240502", 12.0)]
+        assert connection.execute(
+            "SELECT d.trade_date, MAX(e.revenue_ttm) FROM dates AS d "
+            "LEFT JOIN financial_report_event AS e "
+            "ON e.ts_code = d.ts_code AND e.effective_date < d.trade_date "
+            "GROUP BY d.trade_date ORDER BY d.trade_date"
+        ).fetchall() == [("20240430", None), ("20240501", 11.0)]
     finally:
         connection.close()
     print(
         "Self-tests passed: Q1-Q4 TTM, direct YoY indicators, missing "
-        "components, MRQ, q-4, strict effective date, schema"
+        "components, MRQ, q-4, strict effective date, schema, CNE6 migrations, "
+        "report-event upsert and revisions"
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true", help="run offline formula and schema checks")
+    parser.add_argument(
+        "--sync-report-events", action="store_true",
+        help="upsert all quarterly financial report events without changing financial",
+    )
     parser.add_argument(
         "--full-rebuild",
         action="store_true",
@@ -1245,6 +1756,123 @@ def main() -> None:
         ).fetchone()
         universe = {row[0] for row in connection.execute("SELECT DISTINCT ts_code FROM market").fetchall()}
         all_periods = quarter_periods(FIRST_PERIOD, market_max)
+        if args.sync_report_events:
+            if args.full_rebuild:
+                raise ValueError("--sync-report-events cannot be combined with --full-rebuild")
+            validate_key_state(connection)
+            pro = ts.pro_api(TUSHARE_API_KEY.strip())
+            sync_financial_report_events(
+                connection, pro, universe, market_max, counters
+            )
+            return
+        if (
+            not args.full_rebuild
+            and financial_needs_cne6_cashflow_fields(connection)
+        ):
+            validate_key_state(connection)
+            print(
+                "Mode: add two CNE6 cash-flow fields only; "
+                f"market={market_rows:,} rows, {len(universe):,} stocks, "
+                f"{market_min}-{market_max}; fetching {len(all_periods)} quarters "
+                f"({all_periods[0]}-{all_periods[-1]})"
+            )
+            pro = ts.pro_api(TUSHARE_API_KEY.strip())
+            raw_cashflow = fetch_source(
+                pro,
+                "cashflow",
+                all_periods,
+                universe,
+                market_max,
+                counters,
+                fill_interior_gaps=False,
+            )
+            cashflow_events = build_ttm_events(
+                raw_cashflow,
+                CASHFLOW_FIELDS,
+                CASHFLOW_OUTPUTS,
+                set(all_periods),
+            )
+            add_cne6_cashflow_fields(connection, cashflow_events)
+            print("API summary:")
+            for endpoint in sorted(counters):
+                counter = counters[endpoint]
+                print(
+                    f"  {endpoint}: calls={counter.calls:,}, "
+                    f"retries={counter.retries:,}, "
+                    f"fallback_calls={counter.fallback_calls:,}, "
+                    f"capped_responses={counter.capped_responses:,}"
+                )
+            report_coverage(connection)
+            print(
+                "Done. financial now includes n_cashflow_inv_act_ttm and "
+                "n_incr_cash_cash_equ_ttm; all existing rows, keys, and "
+                "column values were preserved."
+            )
+            return
+
+        if not args.full_rebuild and financial_needs_cne6_fields(connection):
+            validate_key_state(connection)
+            print(
+                f"Mode: add CNE6 financial fields only; market={market_rows:,} rows, "
+                f"{len(universe):,} stocks, {market_min}-{market_max}; "
+                f"fetching {len(all_periods)} quarters "
+                f"({all_periods[0]}-{all_periods[-1]})"
+            )
+            pro = ts.pro_api(TUSHARE_API_KEY.strip())
+            raw_income = fetch_source(
+                pro,
+                "income",
+                all_periods,
+                universe,
+                market_max,
+                counters,
+                fill_interior_gaps=False,
+            )
+            raw_balance = fetch_source(
+                pro,
+                "balancesheet",
+                all_periods,
+                universe,
+                market_max,
+                counters,
+                fill_interior_gaps=False,
+            )
+            raw_cashflow = fetch_source(
+                pro,
+                "cashflow",
+                all_periods,
+                universe,
+                market_max,
+                counters,
+                fill_interior_gaps=False,
+            )
+            calculate_periods = set(all_periods)
+            income_events = build_ttm_events(
+                raw_income, INCOME_FIELDS, INCOME_OUTPUTS, calculate_periods
+            )
+            balance_events = build_balance_events(raw_balance, calculate_periods)
+            cashflow_events = build_ttm_events(
+                raw_cashflow, CASHFLOW_FIELDS, CASHFLOW_OUTPUTS, calculate_periods
+            )
+            add_cne6_financial_fields(
+                connection, income_events, balance_events, cashflow_events
+            )
+            print("API summary:")
+            for endpoint in sorted(counters):
+                counter = counters[endpoint]
+                print(
+                    f"  {endpoint}: calls={counter.calls:,}, "
+                    f"retries={counter.retries:,}, "
+                    f"fallback_calls={counter.fallback_calls:,}, "
+                    f"capped_responses={counter.capped_responses:,}"
+                )
+            report_coverage(connection)
+            print(
+                "Done. financial now includes five CNE6 input fields; "
+                "all existing rows, keys, and column values were preserved."
+            )
+            return
+
         if not args.full_rebuild and financial_needs_growth_fields(connection):
             validate_key_state(connection)
             print(

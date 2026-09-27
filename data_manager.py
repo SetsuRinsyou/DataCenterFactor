@@ -5,7 +5,24 @@ import pandas as pd
 import numpy as np
 from collections import defaultdict
 from itertools import groupby
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
+
+
+ANALYST_FORECAST_FIELDS = {
+    "forecast_np_12m",
+    "forecast_eps_12m",
+    "forecast_eps_12m_std",
+    "forecast_dividend_yield_12m",
+    "forecast_eps_fy1_fy3_cagr",
+    "forecast_revision_up_count",
+    "forecast_revision_down_count",
+    "forecast_revision_total_count",
+}
+DIVIDEND_FIELDS = {
+    "cash_div_tax_ttm",
+    "previous_month_end_raw_close",
+}
+
 
 class DataManager(object):
 
@@ -16,6 +33,10 @@ class DataManager(object):
         self.factor_connection = None
         self.market_columns = set()
         self.financial_columns = set()
+        self.financial_report_columns = set()
+        self.industry_columns = set()
+        self.analyst_forecast_columns = set()
+        self.dividend_columns = set()
         self.minute_columns = set()
         self.factor_columns = set()
 
@@ -49,6 +70,24 @@ class DataManager(object):
         # 检验各数据源中所需的表和字段。
         self.market_columns = {row[1] for row in self.connection.execute("PRAGMA table_info('market')").fetchall()}
         self.financial_columns = {row[1] for row in self.connection.execute("PRAGMA table_info('financial')").fetchall()}
+        tables = {row[0] for row in self.connection.execute("SHOW TABLES").fetchall()}
+        if "financial_report_event" in tables:
+            self.financial_report_columns = {
+                row[1] for row in self.connection.execute(
+                    "PRAGMA table_info('financial_report_event')"
+                ).fetchall()
+            } - {"ts_code", "report_end_date", "source_type", "effective_date", "comp_type"}
+        if "industry" in tables:
+            self.industry_columns = {
+                row[1]
+                for row in self.connection.execute(
+                    "PRAGMA table_info('industry')"
+                ).fetchall()
+            } - {"trade_date", "ts_code"}
+        if "analyst_forecast" in tables:
+            self.analyst_forecast_columns = ANALYST_FORECAST_FIELDS.copy()
+        if "dividend" in tables:
+            self.dividend_columns = DIVIDEND_FIELDS.copy()
         if self.minute_connection is not None:
             self.minute_columns = {row[1] for row in self.minute_connection.execute("PRAGMA table_info('market_1min')").fetchall()}
         if self.factor_connection is not None:
@@ -345,12 +384,12 @@ class DataManager(object):
 
         columns = ["trade_date", "code", *factor_fields]
         column_sql = ", ".join('"' + field.replace('"', '""') + '"' for field in columns)
-        placeholders = ", ".join("?" for _ in symbols)
+        symbol_placeholders = ", ".join("?" for _ in symbols)
         start_date = self.get_pre_window_start_date(trade_dates[0], pre_window)
         data = self.factor_connection.execute(
             f"""
             SELECT {column_sql} FROM factor
-            WHERE trade_date BETWEEN ? AND ? AND code IN ({placeholders})
+            WHERE trade_date BETWEEN ? AND ? AND code IN ({symbol_placeholders})
             ORDER BY trade_date, code
             """,
             [start_date, trade_dates[-1], *symbols],
@@ -405,6 +444,643 @@ class DataManager(object):
             [start_date, end_date, *symbols],
         ).fetchdf()
         return data.set_index(["trade_date", "ts_code"])
+
+    def get_financial_report_data(
+        self,
+        trade_dates: list[str],
+        pre_window: str,
+        data_fields: list[str],
+        symbols: list[str],
+    ) -> pd.DataFrame:
+        """Return latest disclosed event values by day, report period, and stock.
+
+        Source revisions are selected independently. An event dated on the signal
+        day is unavailable until the next trading day.
+        """
+        if not self.financial_report_columns:
+            raise ValueError("financial_report_event table is unavailable")
+        missing = set(data_fields) - self.financial_report_columns
+        if missing:
+            raise ValueError(f"financial_report_event missing fields: {sorted(missing)}")
+        if not trade_dates or not symbols or not data_fields:
+            raise ValueError("trade_dates, data_fields, and symbols must be nonempty")
+        start_date = self.get_pre_window_start_date(trade_dates[0], pre_window)
+        report_start = (
+            pd.to_datetime(start_date, format="%Y%m%d") - pd.DateOffset(years=1)
+        ).strftime("%Y%m%d")
+        selected = ", ".join(
+            f'MAX("{field}") AS "{field}"' for field in data_fields
+        )
+        symbol_placeholders = ", ".join("?" for _ in symbols)
+        date_placeholders = ", ".join("?" for _ in trade_dates)
+        data = self.connection.execute(
+            f"""
+            WITH latest AS (
+                SELECT d.cal_date AS trade_date, e.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY d.cal_date, e.ts_code,
+                                        e.report_end_date, e.source_type
+                           ORDER BY e.effective_date DESC
+                       ) AS revision_rank
+                FROM calender AS d
+                JOIN financial_report_event AS e
+                  ON e.effective_date < d.cal_date
+                 AND e.report_end_date <= d.cal_date
+                 AND e.report_end_date >= ?
+                WHERE d.cal_date IN ({date_placeholders}) AND d.is_open = 1
+                  AND e.ts_code IN ({symbol_placeholders})
+            )
+            SELECT trade_date, report_end_date, ts_code, {selected}
+            FROM latest WHERE revision_rank = 1
+            GROUP BY trade_date, report_end_date, ts_code
+            ORDER BY trade_date, report_end_date, ts_code
+            """,
+            [report_start, *trade_dates, *symbols],
+        ).fetchdf()
+        return data.set_index(["trade_date", "report_end_date", "ts_code"])
+
+    def get_industry_data(
+        self,
+        trade_dates: list[str],
+        pre_window: str,
+        data_fields: list[str],
+        symbols: list[str],
+    ) -> pd.DataFrame:
+        """读取按交易日和股票对齐的行业分类字段。"""
+        missing_fields = [
+            field for field in data_fields
+            if field not in self.industry_columns
+        ]
+        if missing_fields:
+            raise ValueError(
+                f"industry table does not contain fields: {missing_fields}"
+            )
+        if len(set(data_fields)) != len(data_fields):
+            raise ValueError("Duplicate industry fields")
+        if not symbols:
+            raise ValueError("symbols list cannot be empty")
+
+        start_date = self.get_pre_window_start_date(trade_dates[0], pre_window)
+        end_date = trade_dates[-1]
+        selected_columns = ["trade_date", "ts_code", *data_fields]
+        column_sql = ", ".join(f'"{column}"' for column in selected_columns)
+        placeholders = ", ".join("?" for _ in symbols)
+        data = self.connection.execute(
+            f"""
+            SELECT {column_sql}
+            FROM industry
+            WHERE trade_date BETWEEN ? AND ?
+              AND ts_code IN ({placeholders})
+            ORDER BY trade_date, ts_code
+            """,
+            [start_date, end_date, *symbols],
+        ).fetchdf()
+        history_dates = [
+            date for date in self.open_dates if start_date <= date <= end_date
+        ]
+        result_index = pd.MultiIndex.from_product(
+            [history_dates, symbols], names=["trade_date", "ts_code"]
+        )
+        return data.set_index(["trade_date", "ts_code"]).reindex(result_index)
+
+    def get_analyst_forecast_data(
+        self,
+        trade_dates: list[str],
+        pre_window: str,
+        data_fields: list[str],
+        symbols: list[str],
+    ) -> pd.DataFrame:
+        """将一对多卖方预测整理为可通过 data_fields 使用的日频输入。"""
+        missing_fields = [
+            field for field in data_fields
+            if field not in self.analyst_forecast_columns
+        ]
+        if missing_fields:
+            raise ValueError(
+                f"Unknown analyst forecast fields: {missing_fields}"
+            )
+        if len(set(data_fields)) != len(data_fields):
+            raise ValueError("Duplicate analyst forecast fields")
+        if not symbols:
+            raise ValueError("symbols list cannot be empty")
+
+        start_date = self.get_pre_window_start_date(trade_dates[0], pre_window)
+        end_date = trade_dates[-1]
+        history_dates = [
+            date for date in self.open_dates if start_date <= date <= end_date
+        ]
+        result_index = pd.MultiIndex.from_product(
+            [history_dates, symbols], names=["trade_date", "ts_code"]
+        )
+        result = pd.DataFrame(index=result_index, columns=data_fields, dtype=float)
+        revision_fields = {
+            "forecast_revision_up_count",
+            "forecast_revision_down_count",
+            "forecast_revision_total_count",
+        }
+        for field in revision_fields.intersection(data_fields):
+            result[field] = 0.0
+        if not data_fields:
+            return result
+
+        requested_fields = set(data_fields)
+        needs_forecast_state = bool(
+            requested_fields - {"forecast_eps_fy1_fy3_cagr"}
+        )
+        needs_cagr = "forecast_eps_fy1_fy3_cagr" in requested_fields
+        placeholders = ", ".join("?" for _ in symbols)
+        baseline = self.connection.execute(
+            f"""
+            WITH candidates AS (
+                SELECT
+                    ts_code,
+                    org_name,
+                    CAST(SUBSTR(quarter, 1, 4) AS INTEGER) AS target_year,
+                    np,
+                    eps,
+                    rd,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY ts_code, org_name, target_year
+                        ORDER BY report_date DESC,
+                                 create_time DESC NULLS LAST,
+                                 report_title DESC NULLS LAST,
+                                 source_row_hash DESC
+                    ) AS row_number
+                FROM analyst_forecast
+                WHERE ?
+                  AND report_date < ?
+                  AND ts_code IN ({placeholders})
+                  AND org_name IS NOT NULL
+                  AND org_name <> ''
+                  AND REGEXP_FULL_MATCH(quarter, '[0-9]{{4}}Q4')
+            )
+            SELECT ts_code, org_name, target_year, np, eps, rd
+            FROM candidates
+            WHERE row_number = 1
+            """,
+            [needs_forecast_state, start_date, *symbols],
+        ).fetchdf()
+        baseline_cagr = self.connection.execute(
+            f"""
+            WITH report_rows AS (
+                SELECT
+                    ts_code,
+                    report_date,
+                    org_name,
+                    COALESCE(author_name, '') AS author_name,
+                    COALESCE(report_title, '') AS report_title,
+                    COALESCE(CAST(create_time AS VARCHAR), '') AS create_time,
+                    CAST(SUBSTR(quarter, 1, 4) AS INTEGER) AS target_year,
+                    TRY_CAST(eps AS DOUBLE) AS eps
+                FROM analyst_forecast
+                WHERE ?
+                  AND report_date < ?
+                  AND ts_code IN ({placeholders})
+                  AND org_name IS NOT NULL
+                  AND org_name <> ''
+                  AND REGEXP_FULL_MATCH(quarter, '[0-9]{{4}}Q4')
+                  AND CAST(SUBSTR(quarter, 1, 4) AS INTEGER)
+                      >= CAST(SUBSTR(report_date, 1, 4) AS INTEGER)
+            ),
+            report_first_year AS (
+                SELECT
+                    ts_code,
+                    report_date,
+                    org_name,
+                    author_name,
+                    report_title,
+                    create_time,
+                    MIN(target_year) AS first_year
+                FROM report_rows
+                GROUP BY ALL
+            ),
+            report_growth AS (
+                SELECT
+                    rows.ts_code,
+                    rows.report_date,
+                    rows.org_name,
+                    rows.report_title,
+                    rows.create_time,
+                    years.first_year,
+                    MAX(CASE
+                        WHEN rows.target_year = years.first_year
+                        THEN rows.eps
+                    END) AS first_eps,
+                    MAX(CASE
+                        WHEN rows.target_year = years.first_year + 2
+                        THEN rows.eps
+                    END) AS third_eps
+                FROM report_rows AS rows
+                JOIN report_first_year AS years
+                  ON rows.ts_code = years.ts_code
+                 AND rows.report_date = years.report_date
+                 AND rows.org_name = years.org_name
+                 AND rows.author_name = years.author_name
+                 AND rows.report_title = years.report_title
+                 AND rows.create_time = years.create_time
+                GROUP BY rows.ts_code, rows.report_date, rows.org_name,
+                         rows.report_title, rows.create_time, years.first_year
+            ),
+            valid_growth AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY ts_code, org_name
+                        ORDER BY report_date DESC, create_time DESC,
+                                 report_title DESC
+                    ) AS row_number
+                FROM report_growth
+                WHERE first_eps > 0 AND third_eps > 0
+            )
+            SELECT
+                ts_code,
+                org_name,
+                first_year,
+                SQRT(third_eps / first_eps) - 1 AS cagr
+            FROM valid_growth
+            WHERE row_number = 1
+            """,
+            [needs_cagr, start_date, *symbols],
+        ).fetchdf()
+        raw = self.connection.execute(
+            f"""
+            SELECT
+                ts_code,
+                report_date,
+                report_title,
+                org_name,
+                author_name,
+                quarter,
+                np,
+                eps,
+                rd,
+                create_time
+            FROM analyst_forecast
+            WHERE report_date BETWEEN ? AND ?
+              AND ts_code IN ({placeholders})
+              AND org_name IS NOT NULL
+              AND org_name <> ''
+              AND REGEXP_FULL_MATCH(quarter, '[0-9]{{4}}Q4')
+            ORDER BY ts_code, report_date, org_name, create_time,
+                     report_title, quarter
+            """,
+            [start_date, end_date, *symbols],
+        ).fetchdf()
+
+        baseline_states = defaultdict(dict)
+        for row in baseline.itertuples(index=False):
+            baseline_states[row.ts_code][
+                (row.org_name, int(row.target_year))
+            ] = {"np": row.np, "eps": row.eps, "rd": row.rd}
+        baseline_cagr_states = defaultdict(dict)
+        for row in baseline_cagr.itertuples(index=False):
+            baseline_cagr_states[row.ts_code][row.org_name] = {
+                "first_year": int(row.first_year),
+                "cagr": row.cagr,
+            }
+
+        report_group_columns = [
+            "ts_code",
+            "report_date",
+            "org_name",
+            "author_name",
+            "report_title",
+            "create_time",
+        ]
+        reports_by_stock = defaultdict(list)
+        if not raw.empty:
+            raw["target_year"] = raw["quarter"].str[:4].astype(int)
+            for identity, group in raw.groupby(
+                report_group_columns, sort=False, dropna=False
+            ):
+                group = (
+                    group.sort_values("target_year")
+                    .drop_duplicates("target_year", keep="last")
+                )
+                report_year = int(str(identity[1])[:4])
+                forward = group[group["target_year"] >= report_year]
+                forecasts = {
+                    int(row.target_year): {
+                        "np": row.np,
+                        "eps": row.eps,
+                        "rd": row.rd,
+                    }
+                    for row in forward.itertuples(index=False)
+                }
+                cagr = np.nan
+                cagr_first_year = None
+                if forecasts:
+                    first_year = min(forecasts)
+                    first_eps = pd.to_numeric(
+                        forecasts[first_year]["eps"], errors="coerce"
+                    )
+                    third_eps = pd.to_numeric(
+                        forecasts.get(first_year + 2, {}).get("eps"),
+                        errors="coerce",
+                    )
+                    if first_eps > 0 and third_eps > 0:
+                        cagr = (third_eps / first_eps) ** 0.5 - 1
+                        cagr_first_year = first_year
+                reports_by_stock[identity[0]].append(
+                    {
+                        "report_date": identity[1],
+                        "org_name": identity[2],
+                        "create_time": identity[5],
+                        "report_title": identity[4],
+                        "forecasts": forecasts,
+                        "cagr": cagr,
+                        "cagr_first_year": cagr_first_year,
+                    }
+                )
+
+        output_rows = []
+        for ts_code in symbols:
+            reports = sorted(
+                reports_by_stock.get(ts_code, []),
+                key=lambda item: (
+                    item["report_date"],
+                    pd.Timestamp.min
+                    if pd.isna(item["create_time"])
+                    else item["create_time"],
+                    "" if pd.isna(item["report_title"]) else item["report_title"],
+                ),
+            )
+            forecast_state = baseline_states.get(ts_code, {}).copy()
+            cagr_state = baseline_cagr_states.get(ts_code, {}).copy()
+            report_position = 0
+            for trade_date in history_dates:
+                up_count = 0
+                down_count = 0
+                total_count = 0
+                while (
+                    report_position < len(reports)
+                    and reports[report_position]["report_date"] <= trade_date
+                ):
+                    report = reports[report_position]
+                    organization = report["org_name"]
+                    report_year = int(report["report_date"][:4])
+                    report_timestamp = pd.to_datetime(
+                        report["report_date"], format="%Y%m%d"
+                    )
+                    report_year_end = pd.Timestamp(
+                        year=report_year, month=12, day=31
+                    )
+                    report_weight = (
+                        (report_year_end - report_timestamp).days + 1
+                    ) / report_year_end.dayofyear
+                    previous_current = forecast_state.get(
+                        (organization, report_year)
+                    )
+                    previous_following = forecast_state.get(
+                        (organization, report_year + 1)
+                    )
+                    previous_blended_eps = np.nan
+                    if (
+                        previous_current is not None
+                        and previous_following is not None
+                    ):
+                        previous_current_eps = pd.to_numeric(
+                            previous_current["eps"], errors="coerce"
+                        )
+                        previous_following_eps = pd.to_numeric(
+                            previous_following["eps"], errors="coerce"
+                        )
+                        if (
+                            pd.notna(previous_current_eps)
+                            and pd.notna(previous_following_eps)
+                        ):
+                            previous_blended_eps = (
+                                report_weight * previous_current_eps
+                                + (1 - report_weight)
+                                * previous_following_eps
+                            )
+                    for target_year, forecast in report["forecasts"].items():
+                        state_key = (organization, target_year)
+                        forecast_state[state_key] = forecast
+                    current = forecast_state.get((organization, report_year))
+                    following = forecast_state.get(
+                        (organization, report_year + 1)
+                    )
+                    current_blended_eps = np.nan
+                    if current is not None and following is not None:
+                        current_eps = pd.to_numeric(
+                            current["eps"], errors="coerce"
+                        )
+                        following_eps = pd.to_numeric(
+                            following["eps"], errors="coerce"
+                        )
+                        if pd.notna(current_eps) and pd.notna(following_eps):
+                            current_blended_eps = (
+                                report_weight * current_eps
+                                + (1 - report_weight) * following_eps
+                            )
+                    if (
+                        report["report_date"] >= start_date
+                        and pd.notna(current_blended_eps)
+                    ):
+                        total_count += 1
+                        if pd.notna(previous_blended_eps):
+                            if current_blended_eps > previous_blended_eps:
+                                up_count += 1
+                            elif current_blended_eps < previous_blended_eps:
+                                down_count += 1
+                    if pd.notna(report["cagr"]):
+                        cagr_state[organization] = {
+                            "first_year": report["cagr_first_year"],
+                            "cagr": report["cagr"],
+                        }
+                    report_position += 1
+
+                year = int(trade_date[:4])
+                timestamp = pd.to_datetime(trade_date, format="%Y%m%d")
+                year_end = pd.Timestamp(year=year, month=12, day=31)
+                days_in_year = year_end.dayofyear
+                current_weight = ((year_end - timestamp).days + 1) / days_in_year
+
+                organization_names = {
+                    organization
+                    for organization, target_year in forecast_state
+                    if target_year in {year, year + 1}
+                }
+                blended = {"np": [], "eps": [], "rd": []}
+                for organization in organization_names:
+                    current = forecast_state.get((organization, year))
+                    following = forecast_state.get((organization, year + 1))
+                    if current is None or following is None:
+                        continue
+                    for field in blended:
+                        current_value = pd.to_numeric(
+                            current[field], errors="coerce"
+                        )
+                        following_value = pd.to_numeric(
+                            following[field], errors="coerce"
+                        )
+                        if pd.notna(current_value) and pd.notna(following_value):
+                            blended[field].append(
+                                current_weight * current_value
+                                + (1 - current_weight) * following_value
+                            )
+
+                row = {"trade_date": trade_date, "ts_code": ts_code}
+                if "forecast_np_12m" in data_fields:
+                    row["forecast_np_12m"] = (
+                        float(np.median(blended["np"]))
+                        if blended["np"] else np.nan
+                    )
+                if "forecast_eps_12m" in data_fields:
+                    row["forecast_eps_12m"] = (
+                        float(np.median(blended["eps"]))
+                        if blended["eps"] else np.nan
+                    )
+                if "forecast_eps_12m_std" in data_fields:
+                    row["forecast_eps_12m_std"] = (
+                        float(np.std(blended["eps"], ddof=1))
+                        if len(blended["eps"]) >= 2 else np.nan
+                    )
+                if "forecast_dividend_yield_12m" in data_fields:
+                    row["forecast_dividend_yield_12m"] = (
+                        float(np.median(blended["rd"]))
+                        if blended["rd"] else np.nan
+                    )
+                if "forecast_eps_fy1_fy3_cagr" in data_fields:
+                    cagr_values = [
+                        value["cagr"] for value in cagr_state.values()
+                        if value["first_year"] in {year, year + 1}
+                        and pd.notna(value["cagr"])
+                    ]
+                    row["forecast_eps_fy1_fy3_cagr"] = (
+                        float(np.median(cagr_values))
+                        if cagr_values else np.nan
+                    )
+                if "forecast_revision_up_count" in data_fields:
+                    row["forecast_revision_up_count"] = float(up_count)
+                if "forecast_revision_down_count" in data_fields:
+                    row["forecast_revision_down_count"] = float(down_count)
+                if "forecast_revision_total_count" in data_fields:
+                    row["forecast_revision_total_count"] = float(total_count)
+                output_rows.append(row)
+
+        if output_rows:
+            output = pd.DataFrame(output_rows).set_index(
+                ["trade_date", "ts_code"]
+            )
+            result.loc[output.index, data_fields] = output[data_fields]
+        return result
+
+    def get_dividend_data(
+        self,
+        trade_dates: list[str],
+        pre_window: str,
+        data_fields: list[str],
+        symbols: list[str],
+    ) -> pd.DataFrame:
+        """返回历史税前 DPS 和上月月末未复权收盘价。"""
+        missing_fields = [
+            field for field in data_fields
+            if field not in self.dividend_columns
+        ]
+        if missing_fields:
+            raise ValueError(f"Unknown dividend fields: {missing_fields}")
+        if len(set(data_fields)) != len(data_fields):
+            raise ValueError("Duplicate dividend fields")
+        if not symbols:
+            raise ValueError("symbols list cannot be empty")
+
+        start_date = self.get_pre_window_start_date(trade_dates[0], pre_window)
+        end_date = trade_dates[-1]
+        history_dates = [
+            date for date in self.open_dates if start_date <= date <= end_date
+        ]
+        result_index = pd.MultiIndex.from_product(
+            [history_dates, symbols], names=["trade_date", "ts_code"]
+        )
+        result = pd.DataFrame(index=result_index, columns=data_fields, dtype=float)
+        placeholders = ", ".join("?" for _ in symbols)
+
+        if "cash_div_tax_ttm" in data_fields:
+            lower_ex_date = (
+                pd.to_datetime(start_date, format="%Y%m%d")
+                - pd.DateOffset(months=12)
+            ).strftime("%Y%m%d")
+            events = self.connection.execute(
+                f"""
+                SELECT ts_code, effective_date, ex_date, cash_div_tax
+                FROM dividend
+                WHERE div_proc = '实施'
+                  AND cash_div_tax IS NOT NULL
+                  AND effective_date IS NOT NULL
+                  AND ex_date IS NOT NULL
+                  AND ex_date > ?
+                  AND ex_date <= ?
+                  AND effective_date <= ?
+                  AND ts_code IN ({placeholders})
+                ORDER BY ts_code, ex_date, effective_date
+                """,
+                [lower_ex_date, end_date, end_date, *symbols],
+            ).fetchdf()
+            date_array = np.asarray(history_dates)
+            for ts_code in symbols:
+                differences = np.zeros(len(history_dates) + 1, dtype=float)
+                stock_events = events.loc[events["ts_code"] == ts_code]
+                for event in stock_events.itertuples(index=False):
+                    activation_date = max(event.effective_date, event.ex_date)
+                    expiry_date = (
+                        pd.to_datetime(event.ex_date, format="%Y%m%d")
+                        + pd.DateOffset(months=12)
+                    ).strftime("%Y%m%d")
+                    first = int(np.searchsorted(
+                        date_array, activation_date, side="left"
+                    ))
+                    last = int(np.searchsorted(
+                        date_array, expiry_date, side="left"
+                    ))
+                    if first < last and first < len(history_dates):
+                        differences[first] += float(event.cash_div_tax)
+                        differences[min(last, len(history_dates))] -= float(
+                            event.cash_div_tax
+                        )
+                result.loc[
+                    pd.IndexSlice[:, ts_code], "cash_div_tax_ttm"
+                ] = np.cumsum(differences[:-1])
+
+        if "previous_month_end_raw_close" in data_fields:
+            previous_month_end = {}
+            for trade_date in history_dates:
+                month_start = f"{trade_date[:6]}01"
+                position = bisect_left(self.open_dates, month_start) - 1
+                previous_month_end[trade_date] = (
+                    self.open_dates[position] if position >= 0 else None
+                )
+            price_dates = sorted({
+                date for date in previous_month_end.values() if date is not None
+            })
+            if price_dates:
+                date_placeholders = ", ".join("?" for _ in price_dates)
+                prices = self.connection.execute(
+                    f"""
+                    SELECT trade_date, ts_code, close
+                    FROM market
+                    WHERE trade_date IN ({date_placeholders})
+                      AND ts_code IN ({placeholders})
+                    ORDER BY trade_date, ts_code
+                    """,
+                    [*price_dates, *symbols],
+                ).fetchdf().set_index(["trade_date", "ts_code"])["close"]
+                for trade_date in history_dates:
+                    price_date = previous_month_end[trade_date]
+                    if price_date is None:
+                        continue
+                    values = prices.reindex(
+                        pd.MultiIndex.from_product(
+                            [[price_date], symbols],
+                            names=["trade_date", "ts_code"],
+                        )
+                    ).to_numpy()
+                    result.loc[
+                        pd.IndexSlice[trade_date, :],
+                        "previous_month_end_raw_close",
+                    ] = values
+        return result
 
     def get_index_data(self, index_code: str, trade_dates: list[str], pre_window: str) -> pd.DataFrame:
         if not index_code:
