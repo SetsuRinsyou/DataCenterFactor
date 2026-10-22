@@ -43,9 +43,10 @@ class FactorBase(ABC):
         self.minute_window_days = int(minute_window_days)
 
     def compute_eval(
-        self, data_manager: DataManager, forward_days: int
+        self, data_manager: DataManager, forward_days: int, n_groups: int = 5
     ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
-        """计算完整请求区间的因子矩阵、每日 RankIC 和五分层收益。"""
+        """计算完整请求区间的因子矩阵、每日 RankIC 和分层收益（默认五组）。"""
+        self.validate_n_groups(n_groups)
         signals = []
         ic_series = []
         group_returns = []
@@ -295,6 +296,7 @@ class FactorBase(ABC):
                 daily_group_returns = self.calculate_group_returns(
                     signal,
                     future_returns,
+                    n_groups,
                 )
                 daily_group_returns.name = date
                 group_returns.append(daily_group_returns)
@@ -327,9 +329,12 @@ class FactorBase(ABC):
         signal_frame: pd.DataFrame,
         data_manager: DataManager,
         rebalance_days: int,
+        n_groups: int = 5,
+        trade_records: list[dict] | None = None,
     ) -> pd.DataFrame:
-        """次日收盘调仓、持有期固定复权份额，逐交易日计算五组净值。
+        """次日收盘调仓、持有期固定复权份额，逐交易日计算分组净值（默认五组）。
 
+        trade_records 可选接收逐次调仓的持仓数及买卖金额，不改变返回类型。
         无费用；停牌仓位保留，不能买入的目标份额留作现金。
         非停牌报价缺失时拒绝继续估值，避免静默丢失持仓。
         """
@@ -339,10 +344,11 @@ class FactorBase(ABC):
             or rebalance_days <= 0
         ):
             raise ValueError("rebalance_days must be a positive integer")
+        self.validate_n_groups(n_groups)
         dates = data_manager.calender.loc[
             data_manager.calender["is_open"] == 1, "cal_date"
         ].tolist()
-        labels = [f"group_{group}" for group in range(1, 6)]
+        labels = [f"group_{group}" for group in range(1, n_groups + 1)]
         result = pd.DataFrame(
             index=pd.Index(dates[1:], name="trade_date"), columns=labels, dtype=float
         )
@@ -370,8 +376,8 @@ class FactorBase(ABC):
                 else pd.Series(dtype=float)
             )
             groups = (
-                pd.qcut(signal.rank(method="first"), q=5, labels=labels)
-                if len(signal) >= 5 else None
+                pd.qcut(signal.rank(method="first"), q=n_groups, labels=labels)
+                if len(signal) >= n_groups else None
             )
             symbols = sorted(set(signal.index).union(
                 *(set(position.index) for position in holdings.values())
@@ -416,26 +422,45 @@ class FactorBase(ABC):
                             if allocation > 0:
                                 new_position.loc[symbol] = allocation / marks[symbol]
                                 cash[label] -= allocation
+                    if trade_records is not None:
+                        traded = new_position.subtract(position, fill_value=0)
+                        amounts = traded * marks.reindex(traded.index)
+                        trade_records.append({
+                            "trade_date": date, "group": label,
+                            "wealth": wealth,
+                            "buy_amount": float(amounts.clip(lower=0).sum()),
+                            "sell_amount": float(-amounts.clip(upper=0).sum()),
+                            "holdings": len(new_position),
+                        })
                     holdings[label] = new_position
                 last_prices = marks.combine_first(last_prices)
         return result
 
     @staticmethod
+    def validate_n_groups(n_groups: int) -> None:
+        """分组数至少为二，拒绝布尔和非整数。"""
+        if (isinstance(n_groups, bool)
+                or not isinstance(n_groups, (int, np.integer)) or n_groups < 2):
+            raise ValueError("n_groups must be an integer >= 2")
+
+    @staticmethod
     def calculate_group_returns(
         signal: pd.Series,
         future_returns: pd.Series,
+        n_groups: int = 5,
     ) -> pd.Series:
-        """按因子值从低到高五等分，返回各组的等权未来收益。"""
-        group_labels = [f"group_{group}" for group in range(1, 6)]
+        """按因子值从低到高等分，返回各组的等权未来收益。"""
+        FactorBase.validate_n_groups(n_groups)
+        group_labels = [f"group_{group}" for group in range(1, n_groups + 1)]
         result = pd.Series(index=group_labels, dtype=float)
         valid_signal = signal.dropna()
-        if len(valid_signal) < 5:
+        if len(valid_signal) < n_groups:
             return result
 
         # 先按因子分组，再计算收益，避免未来收益缺失影响分组边界。
         groups = pd.qcut(
             valid_signal.rank(method="first"),
-            q=5,
+            q=n_groups,
             labels=group_labels,
         )
         aligned_returns = future_returns.reindex(valid_signal.index)
